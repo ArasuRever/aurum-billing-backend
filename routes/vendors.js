@@ -145,4 +145,22 @@ router.get('/:id/transactions', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ==========================================
+// 7. UPDATE VENDOR DETAILS
+// ==========================================
+router.put('/:id', async (req, res) => {
+  const { id } = req.params;
+  const { business_name, contact_number, address, gst_number } = req.body;
+  
+  try {
+    await pool.query(
+      `UPDATE vendors SET business_name=$1, contact_number=$2, address=$3, gst_number=$4 WHERE id=$5`,
+      [business_name, contact_number, address, gst_number, id]
+    );
+    res.json({ success: true, message: 'Vendor updated' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
