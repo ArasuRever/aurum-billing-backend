@@ -16,6 +16,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use('/api/vendors', require('./routes/vendors'));
 app.use('/api/inventory', require('./routes/inventory'));
 app.use('/api/billing', require('./routes/billing'));
+app.use('/api/shops', require('./routes/shops'));
 // app.use('/api/billing', require('./routes/billing')); // Uncomment when ready
 
 app.listen(PORT, () => {
