@@ -9,15 +9,17 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+
+// --- FIX: INCREASE LIMIT FOR IMAGES ---
+app.use(express.json({ limit: '50mb' })); // Allows large JSON (like Base64 images)
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Mount Routes (Feature-based)
 app.use('/api/vendors', require('./routes/vendors'));
+app.use('/api/customers', require('./routes/customers')); // This must be here
 app.use('/api/inventory', require('./routes/inventory'));
 app.use('/api/billing', require('./routes/billing'));
 app.use('/api/shops', require('./routes/shops'));
-// app.use('/api/billing', require('./routes/billing')); // Uncomment when ready
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
