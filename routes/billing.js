@@ -32,7 +32,7 @@ router.get('/search-item', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. CREATE BILL (ADJUSTED: GROSS WEIGHT DEBT ONLY)
+// 3. CREATE BILL (FIXED: Handles Gold vs Silver Debt)
 router.post('/create-bill', async (req, res) => {
   const { customer, items, exchangeItems, totals, includeGST } = req.body;
   
@@ -76,6 +76,7 @@ router.post('/create-bill', async (req, res) => {
       let neighbourIdToUpdate = null;
       let weightForDebt = 0;
       let description = '';
+      let metalType = item.metal_type || 'GOLD'; // Default to GOLD if not specified
 
       // CASE 1: EXISTING INVENTORY ITEM
       if (item.item_id) {
@@ -89,47 +90,66 @@ router.post('/create-bill', async (req, res) => {
         // Check if this item belongs to a Neighbour Shop
         if (dbItem && dbItem.source_type === 'NEIGHBOUR' && dbItem.neighbour_shop_id) {
             neighbourIdToUpdate = dbItem.neighbour_shop_id;
-            
-            // ADJUSTMENT: Use GROSS WEIGHT only (Ignore Wastage/Purity)
             weightForDebt = parseFloat(dbItem.gross_weight) || 0; 
-            
+            metalType = dbItem.metal_type; // Use the metal type from DB
             description = `Sold Item: ${item.item_name} (${dbItem.barcode})`;
         }
       } 
       // CASE 2: MANUAL ITEM (Using Nick ID)
       else if (item.neighbour_id) {
          neighbourIdToUpdate = item.neighbour_id;
-         
-         const gross = parseFloat(item.gross_weight) || 0;
-         
-         // ADJUSTMENT: Use GROSS WEIGHT only (Ignore Wastage)
-         weightForDebt = gross;
-         
+         weightForDebt = parseFloat(item.gross_weight) || 0;
          description = `Sold Manual Item: ${item.item_name}`;
+         // manual items use item.metal_type passed from frontend
       }
 
       // --- EXECUTE DEBT UPDATE (If valid neighbour found) ---
       if (neighbourIdToUpdate && weightForDebt > 0) {
-          // 1. Update Shop Balance (Increase Debt by Gross Weight)
-          await client.query(
-             `UPDATE external_shops 
-              SET balance_gold = balance_gold + $1 
-              WHERE id = $2`,
-             [weightForDebt, neighbourIdToUpdate]
-          );
+          
+          if (metalType === 'SILVER') {
+              // A. Update SILVER Balance
+              await client.query(
+                 `UPDATE external_shops 
+                  SET balance_silver = balance_silver + $1 
+                  WHERE id = $2`,
+                 [weightForDebt, neighbourIdToUpdate]
+              );
 
-          // 2. Add to Shop Ledger
-          await client.query(
-             `INSERT INTO shop_transactions 
-              (shop_id, type, description, gross_weight, pure_weight, silver_weight, cash_amount)
-              VALUES ($1, 'BORROW_ADD', $2, $3, $4, 0, 0)`,
-             [
-                 neighbourIdToUpdate, 
-                 description, 
-                 item.gross_weight, 
-                 weightForDebt // Storing Gross Weight in the 'pure_weight' column as the value owed
-             ]
-          );
+              // B. Add to Shop Ledger (Silver Column)
+              await client.query(
+                 `INSERT INTO shop_transactions 
+                  (shop_id, type, description, gross_weight, pure_weight, silver_weight, cash_amount)
+                  VALUES ($1, 'BORROW_ADD', $2, $3, 0, $4, 0)`,
+                 [
+                     neighbourIdToUpdate, 
+                     description, 
+                     item.gross_weight, 
+                     weightForDebt // Log in silver_weight column
+                 ]
+              );
+
+          } else {
+              // A. Update GOLD Balance (Default)
+              await client.query(
+                 `UPDATE external_shops 
+                  SET balance_gold = balance_gold + $1 
+                  WHERE id = $2`,
+                 [weightForDebt, neighbourIdToUpdate]
+              );
+
+              // B. Add to Shop Ledger (Pure/Gold Column)
+              await client.query(
+                 `INSERT INTO shop_transactions 
+                  (shop_id, type, description, gross_weight, pure_weight, silver_weight, cash_amount)
+                  VALUES ($1, 'BORROW_ADD', $2, $3, $4, 0, 0)`,
+                 [
+                     neighbourIdToUpdate, 
+                     description, 
+                     item.gross_weight, 
+                     weightForDebt // Log in pure_weight column
+                 ]
+              );
+          }
       }
     }
 

@@ -7,7 +7,7 @@ const multer = require('multer');
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// 1. ADD VENDOR (Updated to save vendor_type)
+// 1. ADD VENDOR
 router.post('/add', async (req, res) => {
   const { business_name, contact_number, address, gst_number, vendor_type } = req.body;
   try {
@@ -33,7 +33,7 @@ router.get('/search', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. UPDATE VENDOR DETAILS (Updated to save vendor_type)
+// 3. UPDATE VENDOR DETAILS
 router.put('/:id', async (req, res) => {
   const { id } = req.params;
   const { business_name, contact_number, address, gst_number, vendor_type } = req.body;
@@ -48,7 +48,7 @@ router.put('/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. ADD AGENT (Restored)
+// 4. ADD AGENT
 router.post('/add-agent', upload.single('agent_photo'), async (req, res) => {
   const { vendor_id, agent_name, agent_phone } = req.body;
   const agent_photo = req.file ? req.file.buffer : null;
@@ -61,7 +61,7 @@ router.post('/add-agent', upload.single('agent_photo'), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 5. GET AGENTS (Restored - Fixes missing agents)
+// 5. GET AGENTS
 router.get('/:id/agents', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM vendor_agents WHERE vendor_id = $1 ORDER BY id DESC', [req.params.id]);
@@ -73,7 +73,7 @@ router.get('/:id/agents', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 6. UPDATE AGENT (Restored)
+// 6. UPDATE AGENT
 router.put('/agent/:id', upload.single('agent_photo'), async (req, res) => {
   const { id } = req.params;
   const { agent_name, agent_phone } = req.body;
@@ -89,7 +89,7 @@ router.put('/agent/:id', upload.single('agent_photo'), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 7. DELETE AGENT (Restored)
+// 7. DELETE AGENT
 router.delete('/agent/:id', async (req, res) => {
   try {
     await pool.query('DELETE FROM vendor_agents WHERE id = $1', [req.params.id]);
@@ -97,7 +97,7 @@ router.delete('/agent/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 8. GET TRANSACTIONS (Restored - Fixes missing Ledger)
+// 8. GET TRANSACTIONS
 router.get('/:id/transactions', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM vendor_transactions WHERE vendor_id = $1 ORDER BY created_at DESC', [req.params.id]);
@@ -105,49 +105,61 @@ router.get('/:id/transactions', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 9. MANUAL LEDGER TRANSACTION (For Settlements)
+// 9. MANUAL LEDGER TRANSACTION (Fixed: Safe Number Handling)
 router.post('/transaction', async (req, res) => {
     const { vendor_id, type, description, metal_weight, cash_amount, conversion_rate } = req.body;
-    
     const client = await pool.connect();
+    
     try {
       await client.query('BEGIN');
       
+      // Calculate Pure Weight Impact
       let pureImpact = 0;
       let cashConverted = 0;
 
-      // REPAYMENT LOGIC: Reduces the debt (Balance goes DOWN)
-      if (type === 'REPAYMENT') {
-          // 1. Metal Repayment
-          if (metal_weight) pureImpact += parseFloat(metal_weight);
-          
-          // 2. Cash Repayment (Converted to Metal)
-          if (cash_amount && conversion_rate) {
-              cashConverted = parseFloat(cash_amount) / parseFloat(conversion_rate);
-              pureImpact += cashConverted;
-          }
+      // Safe number conversion (Handle empty strings as 0)
+      const safeMetal = parseFloat(metal_weight) || 0;
+      const safeCash = parseFloat(cash_amount) || 0;
+      const safeRate = parseFloat(conversion_rate) || 0;
+
+      if (type === 'STOCK_ADDED') {
+        pureImpact = safeMetal;
+      } else if (type === 'REPAYMENT') {
+        // Metal Repayment
+        pureImpact = -safeMetal; 
+        // Cash Repayment
+        if (safeCash > 0 && safeRate > 0) {
+          cashConverted = safeCash / safeRate;
+          pureImpact -= cashConverted;
+        }
       }
 
-      // Update Vendor Balance (Decrease by pureImpact)
-      await client.query(
-          `UPDATE vendors SET balance_pure_weight = balance_pure_weight - $1 WHERE id = $2`,
-          [pureImpact, vendor_id]
-      );
+      // Update Vendor Balance (Handle null balance safely)
+      const vendRes = await client.query('SELECT balance_pure_weight FROM vendors WHERE id = $1 FOR UPDATE', [vendor_id]);
+      const currentBal = parseFloat(vendRes.rows[0].balance_pure_weight) || 0;
+      const newBal = currentBal + pureImpact;
 
-      // Log Transaction
+      await client.query('UPDATE vendors SET balance_pure_weight = $1 WHERE id = $2', [newBal, vendor_id]);
+
+      // Log Transaction (Sanitized inputs)
+      const totalRepaidPure = type === 'REPAYMENT' ? (safeMetal + cashConverted) : 0;
+      
       await client.query(
-          `INSERT INTO vendor_transactions 
-          (vendor_id, type, description, repaid_metal_weight, cash_amount, conversion_rate, cash_converted_weight, balance_after)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, (SELECT balance_pure_weight FROM vendors WHERE id=$1))`,
-          [
-              vendor_id, type, description, 
-              parseFloat(metal_weight)||0, parseFloat(cash_amount)||0, parseFloat(conversion_rate)||0, cashConverted
-          ]
+        `INSERT INTO vendor_transactions 
+        (vendor_id, type, description, stock_pure_weight, repaid_metal_weight, repaid_cash_amount, conversion_rate, cash_converted_weight, total_repaid_pure, balance_after)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [
+            vendor_id, type, description, 
+            (type==='STOCK_ADDED' ? safeMetal : 0), 
+            (type==='REPAYMENT' ? safeMetal : 0), 
+            safeCash, safeRate, cashConverted, totalRepaidPure, newBal
+        ]
       );
 
       await client.query('COMMIT');
-      res.json({ success: true });
-    } catch(err) {
+      res.json({ success: true, new_balance: newBal });
+
+    } catch (err) {
       await client.query('ROLLBACK');
       res.status(500).json({ error: err.message });
     } finally {

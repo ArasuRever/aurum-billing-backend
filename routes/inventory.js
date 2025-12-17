@@ -8,7 +8,7 @@ const upload = multer({ storage: storage });
 
 // 1. ADD ITEM (Now correctly updates Vendor Balance)
 router.post('/add', upload.single('item_image'), async (req, res) => {
-  let { 
+  const { 
     vendor_id, neighbour_shop_id, source_type, 
     metal_type, item_name, gross_weight, wastage_percent, making_charges, stock_type 
   } = req.body;
@@ -19,8 +19,9 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // 1. SET DEFAULTS
-    source_type = source_type || 'VENDOR'; // Default to VENDOR if undefined
+    // --- FIX IS HERE: Set Default Source ---
+    // If source_type is missing, assume it is a VENDOR item
+    const finalSource = source_type || 'VENDOR'; 
     
     const prefix = metal_type === 'GOLD' ? 'G' : 'S';
     const barcode = `${prefix}-${Date.now()}`;
@@ -36,7 +37,7 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
       [
         vendor_id || null, 
         neighbour_shop_id || null, 
-        source_type, 
+        finalSource, // Use the fixed variable
         metal_type, item_name, barcode, gross, purity, making_charges, pure_weight, item_image, 
         stock_type || 'SINGLE'
       ]
@@ -44,12 +45,15 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
     const newItem = itemRes.rows[0];
 
     // 3. IF VENDOR -> Update Vendor Ledger
-    // The fix: We now use the 'source_type' variable which defaults to 'VENDOR' correctly
-    if (source_type === 'VENDOR' && vendor_id) {
+    // We use 'finalSource' here so it definitely enters this block
+    if (finalSource === 'VENDOR' && vendor_id) {
+        // A. Increase Vendor Balance
         await client.query(
             `UPDATE vendors SET balance_pure_weight = balance_pure_weight + $1 WHERE id = $2`,
             [pure_weight, vendor_id]
         );
+        
+        // B. Add Transaction Entry
         await client.query(
             `INSERT INTO vendor_transactions 
             (vendor_id, type, description, stock_pure_weight, balance_after)
@@ -108,7 +112,6 @@ router.put('/update/:id', async (req, res) => {
   try {
     await client.query('BEGIN');
     
-    // Get Old Item to Calculate Difference
     const oldRes = await client.query('SELECT * FROM inventory_items WHERE id = $1', [id]);
     const oldItem = oldRes.rows[0];
     
@@ -117,13 +120,11 @@ router.put('/update/:id', async (req, res) => {
     const newPure = newGross * (newPurity / 100);
     const oldPure = parseFloat(oldItem.pure_weight);
     
-    const diffPure = newPure - oldPure; // Difference to adjust in Vendor Balance
+    const diffPure = newPure - oldPure;
 
-    // Update Item
     await client.query(`INSERT INTO item_updates (item_id, old_values, update_comment) VALUES ($1, $2, $3)`, [id, JSON.stringify(oldItem), update_comment]);
     await client.query(`UPDATE inventory_items SET gross_weight=$1, wastage_percent=$2, pure_weight=$3 WHERE id=$4`, [newGross, newPurity, newPure, id]);
     
-    // Adjust Vendor Balance if Weight Changed
     if (oldItem.vendor_id && diffPure !== 0) {
         await client.query(`UPDATE vendors SET balance_pure_weight = balance_pure_weight + $1 WHERE id = $2`, [diffPure, oldItem.vendor_id]);
         await client.query(
@@ -150,7 +151,6 @@ router.delete('/:id', async (req, res) => {
     if (item) {
         await client.query('DELETE FROM inventory_items WHERE id = $1', [id]);
 
-        // Reverse Vendor Balance Only if it was a Vendor Item
         if (item.source_type === 'VENDOR' && item.vendor_id) {
             const reduction = parseFloat(item.pure_weight) || 0;
             await client.query('UPDATE vendors SET balance_pure_weight = balance_pure_weight - $1 WHERE id = $2', [reduction, item.vendor_id]);
