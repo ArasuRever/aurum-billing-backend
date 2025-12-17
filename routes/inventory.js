@@ -6,10 +6,10 @@ const multer = require('multer');
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// 1. ADD ITEM (Handles VENDOR and NEIGHBOUR)
+// 1. ADD ITEM (Now correctly updates Vendor Balance)
 router.post('/add', upload.single('item_image'), async (req, res) => {
-  const { 
-    vendor_id, neighbour_shop_id, source_type, // 'VENDOR' or 'NEIGHBOUR'
+  let { 
+    vendor_id, neighbour_shop_id, source_type, 
     metal_type, item_name, gross_weight, wastage_percent, making_charges, stock_type 
   } = req.body;
   
@@ -19,13 +19,16 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    // 1. SET DEFAULTS
+    source_type = source_type || 'VENDOR'; // Default to VENDOR if undefined
+    
     const prefix = metal_type === 'GOLD' ? 'G' : 'S';
     const barcode = `${prefix}-${Date.now()}`;
     const gross = parseFloat(gross_weight) || 0;
     const purity = parseFloat(wastage_percent) || 0;
     const pure_weight = gross * (purity / 100); 
 
-    // 1. Insert into Inventory
+    // 2. Insert into Inventory
     const itemRes = await client.query(
       `INSERT INTO inventory_items 
       (vendor_id, neighbour_shop_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, item_image, status, stock_type)
@@ -33,14 +36,15 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
       [
         vendor_id || null, 
         neighbour_shop_id || null, 
-        source_type || 'VENDOR', // Default to VENDOR if missing
+        source_type, 
         metal_type, item_name, barcode, gross, purity, making_charges, pure_weight, item_image, 
         stock_type || 'SINGLE'
       ]
     );
     const newItem = itemRes.rows[0];
 
-    // 2. IF VENDOR -> Update Vendor Ledger
+    // 3. IF VENDOR -> Update Vendor Ledger
+    // The fix: We now use the 'source_type' variable which defaults to 'VENDOR' correctly
     if (source_type === 'VENDOR' && vendor_id) {
         await client.query(
             `UPDATE vendors SET balance_pure_weight = balance_pure_weight + $1 WHERE id = $2`,
@@ -54,9 +58,6 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
         );
     }
     
-    // 3. IF NEIGHBOUR -> We do NOT create debt yet. 
-    // (As per your rule: Debt is only created when we SELL the item)
-
     await client.query('COMMIT');
     res.json({ success: true, item: newItem });
 
@@ -68,7 +69,7 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
   }
 });
 
-// 2. LIST ALL ITEMS (With Source Info)
+// 2. LIST ALL ITEMS
 router.get('/list', async (req, res) => {
   try {
     const result = await pool.query(`
