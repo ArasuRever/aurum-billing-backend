@@ -195,26 +195,32 @@ router.put('/:id', async (req, res) => {
 
 router.put('/transaction/:id', async (req, res) => {
   const { id } = req.params;
-  const { description, gross_weight, wastage_percent, mc_rate, pure_weight, silver_weight, making_charges, cash_amount } = req.body;
+  const { description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount } = req.body;
   
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // 1. Fetch Old Transaction
+    // 1. Fetch Old Transaction to know what to reverse
     const oldRes = await client.query('SELECT * FROM shop_transactions WHERE id = $1', [id]);
     if (oldRes.rows.length === 0) throw new Error("Transaction not found");
     const oldTxn = oldRes.rows[0];
 
     // 2. Reverse Old Balance Impact
-    // If it was BORROW_ADD (Debt), we subtract the old amounts to clear them.
-    // If it was LEND_ADD (Credit), we add the old amounts to clear them.
-    if (oldTxn.type === 'BORROW_ADD') {
-       await client.query(`UPDATE external_shops SET balance_gold = balance_gold - $1, balance_silver = balance_silver - $2, balance_cash = balance_cash - $3 WHERE id = $4`, 
-       [oldTxn.pure_weight, oldTxn.silver_weight, oldTxn.cash_amount, oldTxn.shop_id]);
-    } else if (oldTxn.type === 'LEND_ADD') {
+    // If it was BORROW_ADD (Debt increased), we subtract the old amount.
+    // If it was LEND_ADD (Credit increased / Balance decreased), we add the old amount.
+    let old_g = parseFloat(oldTxn.pure_weight) || 0;
+    let old_s = parseFloat(oldTxn.silver_weight) || 0;
+    let old_c = parseFloat(oldTxn.cash_amount) || 0;
+
+    if (oldTxn.type === 'LEND_ADD' || oldTxn.type === 'BORROW_REPAY') {
+       // Reverse negative impact by adding
        await client.query(`UPDATE external_shops SET balance_gold = balance_gold + $1, balance_silver = balance_silver + $2, balance_cash = balance_cash + $3 WHERE id = $4`, 
-       [oldTxn.pure_weight, oldTxn.silver_weight, oldTxn.cash_amount, oldTxn.shop_id]);
+       [old_g, old_s, old_c, oldTxn.shop_id]);
+    } else {
+       // Reverse positive impact by subtracting
+       await client.query(`UPDATE external_shops SET balance_gold = balance_gold - $1, balance_silver = balance_silver - $2, balance_cash = balance_cash - $3 WHERE id = $4`, 
+       [old_g, old_s, old_c, oldTxn.shop_id]);
     }
 
     // 3. Update Transaction Record
@@ -226,12 +232,18 @@ router.put('/transaction/:id', async (req, res) => {
     );
 
     // 4. Apply New Balance Impact
-    if (oldTxn.type === 'BORROW_ADD') {
-       await client.query(`UPDATE external_shops SET balance_gold = balance_gold + $1, balance_silver = balance_silver + $2, balance_cash = balance_cash + $3 WHERE id = $4`, 
-       [pure_weight, silver_weight, cash_amount, oldTxn.shop_id]);
-    } else if (oldTxn.type === 'LEND_ADD') {
+    let new_g = parseFloat(pure_weight) || 0;
+    let new_s = parseFloat(silver_weight) || 0;
+    let new_c = parseFloat(cash_amount) || 0;
+
+    if (oldTxn.type === 'LEND_ADD' || oldTxn.type === 'BORROW_REPAY') {
+       // Apply Negative Impact
        await client.query(`UPDATE external_shops SET balance_gold = balance_gold - $1, balance_silver = balance_silver - $2, balance_cash = balance_cash - $3 WHERE id = $4`, 
-       [pure_weight, silver_weight, cash_amount, oldTxn.shop_id]);
+       [new_g, new_s, new_c, oldTxn.shop_id]);
+    } else {
+       // Apply Positive Impact
+       await client.query(`UPDATE external_shops SET balance_gold = balance_gold + $1, balance_silver = balance_silver + $2, balance_cash = balance_cash + $3 WHERE id = $4`, 
+       [new_g, new_s, new_c, oldTxn.shop_id]);
     }
 
     await client.query('COMMIT');
