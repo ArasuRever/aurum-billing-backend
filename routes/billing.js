@@ -32,7 +32,7 @@ router.get('/search-item', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. CREATE BILL (FIXED: Handles Gold vs Silver Debt)
+// 3. CREATE BILL (Integrated with Shop Ledger)
 router.post('/create-bill', async (req, res) => {
   const { customer, items, exchangeItems, totals, includeGST } = req.body;
   
@@ -97,10 +97,10 @@ router.post('/create-bill', async (req, res) => {
       } 
       // CASE 2: MANUAL ITEM (Using Nick ID)
       else if (item.neighbour_id) {
-         neighbourIdToUpdate = item.neighbour_id;
-         weightForDebt = parseFloat(item.gross_weight) || 0;
-         description = `Sold Manual Item: ${item.item_name}`;
-         // manual items use item.metal_type passed from frontend
+          neighbourIdToUpdate = item.neighbour_id;
+          weightForDebt = parseFloat(item.gross_weight) || 0;
+          description = `Sold Manual Item: ${item.item_name}`;
+          // manual items use item.metal_type passed from frontend
       }
 
       // --- EXECUTE DEBT UPDATE (If valid neighbour found) ---
