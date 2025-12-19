@@ -21,6 +21,9 @@ app.use('/api/inventory', require('./routes/inventory'));
 app.use('/api/billing', require('./routes/billing'));
 app.use('/api/shops', require('./routes/shops'));
 
+// SETTING
+app.use('/api/settings', require('./routes/settings'));
+
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
