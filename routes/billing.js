@@ -2,11 +2,20 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 
-// 1. GET INVOICE DETAILS
+// 1. GET INVOICE DETAILS (Updated to support searching by ID or Invoice Number)
 router.get('/invoice/:id', async (req, res) => {
     const { id } = req.params;
     try {
-        const sale = await pool.query("SELECT * FROM sales WHERE invoice_number = $1", [id]);
+        let query = "SELECT * FROM sales WHERE invoice_number = $1";
+        let params = [id];
+        
+        // If id is numeric, search by ID as well
+        if (!isNaN(id)) {
+             query = "SELECT * FROM sales WHERE id = $1 OR invoice_number = $2";
+             params = [id, id];
+        }
+
+        const sale = await pool.query(query, params);
         if(sale.rows.length === 0) return res.status(404).json({error: "Invoice not found"});
         
         const items = await pool.query("SELECT * FROM sale_items WHERE sale_id = $1", [sale.rows[0].id]);
@@ -41,7 +50,7 @@ router.post('/create-bill', async (req, res) => {
     await client.query('BEGIN');
     const invoiceNumber = `INV-${Date.now()}`;
 
-    // 1. Create Sale Record
+    // A. Create Sale Record
     const netPayable = totals.netPayable || 0;
     const paid = totals.paidAmount !== undefined ? totals.paidAmount : netPayable;
     const balance = totals.balance !== undefined ? totals.balance : 0;
@@ -62,9 +71,8 @@ router.post('/create-bill', async (req, res) => {
     );
     const saleId = saleRes.rows[0].id;
 
-    // 2. Process Sale Items & Handle Neighbour Debt
+    // B. Process Sale Items
     for (const item of items) {
-      // A. Insert into sale_items
       await client.query(
         `INSERT INTO sale_items 
         (sale_id, item_id, item_name, sold_weight, sold_rate, making_charges_collected, total_item_price)
@@ -72,88 +80,48 @@ router.post('/create-bill', async (req, res) => {
         [saleId, item.item_id || null, item.item_name, item.gross_weight, item.rate, item.making_charges || 0, item.total]
       );
 
-      // --- NEIGHBOUR DEBT LOGIC ---
+      // Handle Inventory & Neighbor Debt
       let neighbourIdToUpdate = null;
       let weightForDebt = 0;
       let description = '';
-      let metalType = item.metal_type || 'GOLD'; // Default to GOLD if not specified
+      let metalType = item.metal_type || 'GOLD';
 
-      // CASE 1: EXISTING INVENTORY ITEM
       if (item.item_id) {
-        // Mark as SOLD and get details
+        // Update Inventory to SOLD
         const updateRes = await client.query(
             `UPDATE inventory_items SET status = 'SOLD' WHERE id = $1 RETURNING *`, 
             [item.item_id]
         );
         const dbItem = updateRes.rows[0];
 
-        // Check if this item belongs to a Neighbour Shop
+        // Check if Neighbor Item
         if (dbItem && dbItem.source_type === 'NEIGHBOUR' && dbItem.neighbour_shop_id) {
             neighbourIdToUpdate = dbItem.neighbour_shop_id;
             weightForDebt = parseFloat(dbItem.gross_weight) || 0; 
-            metalType = dbItem.metal_type; // Use the metal type from DB
+            metalType = dbItem.metal_type;
             description = `Sold Item: ${item.item_name} (${dbItem.barcode})`;
         }
       } 
-      // CASE 2: MANUAL ITEM (Using Nick ID)
       else if (item.neighbour_id) {
+          // Manual Neighbor Item
           neighbourIdToUpdate = item.neighbour_id;
           weightForDebt = parseFloat(item.gross_weight) || 0;
           description = `Sold Manual Item: ${item.item_name}`;
-          // manual items use item.metal_type passed from frontend
       }
 
-      // --- EXECUTE DEBT UPDATE (If valid neighbour found) ---
+      // Add to Debt if Neighbor
       if (neighbourIdToUpdate && weightForDebt > 0) {
-          
           if (metalType === 'SILVER') {
-              // A. Update SILVER Balance
-              await client.query(
-                 `UPDATE external_shops 
-                  SET balance_silver = balance_silver + $1 
-                  WHERE id = $2`,
-                 [weightForDebt, neighbourIdToUpdate]
-              );
-
-              // B. Add to Shop Ledger (Silver Column)
-              await client.query(
-                 `INSERT INTO shop_transactions 
-                  (shop_id, type, description, gross_weight, pure_weight, silver_weight, cash_amount)
-                  VALUES ($1, 'BORROW_ADD', $2, $3, 0, $4, 0)`,
-                 [
-                     neighbourIdToUpdate, 
-                     description, 
-                     item.gross_weight, 
-                     weightForDebt // Log in silver_weight column
-                 ]
-              );
-
+              await client.query(`UPDATE external_shops SET balance_silver = balance_silver + $1 WHERE id = $2`, [weightForDebt, neighbourIdToUpdate]);
+              await client.query(`INSERT INTO shop_transactions (shop_id, type, description, gross_weight, pure_weight, silver_weight, cash_amount) VALUES ($1, 'BORROW_ADD', $2, $3, 0, $4, 0)`, [neighbourIdToUpdate, description, item.gross_weight, weightForDebt]);
           } else {
-              // A. Update GOLD Balance (Default)
-              await client.query(
-                 `UPDATE external_shops 
-                  SET balance_gold = balance_gold + $1 
-                  WHERE id = $2`,
-                 [weightForDebt, neighbourIdToUpdate]
-              );
-
-              // B. Add to Shop Ledger (Pure/Gold Column)
-              await client.query(
-                 `INSERT INTO shop_transactions 
-                  (shop_id, type, description, gross_weight, pure_weight, silver_weight, cash_amount)
-                  VALUES ($1, 'BORROW_ADD', $2, $3, $4, 0, 0)`,
-                 [
-                     neighbourIdToUpdate, 
-                     description, 
-                     item.gross_weight, 
-                     weightForDebt // Log in pure_weight column
-                 ]
-              );
+              await client.query(`UPDATE external_shops SET balance_gold = balance_gold + $1 WHERE id = $2`, [weightForDebt, neighbourIdToUpdate]);
+              await client.query(`INSERT INTO shop_transactions (shop_id, type, description, gross_weight, pure_weight, silver_weight, cash_amount) VALUES ($1, 'BORROW_ADD', $2, $3, $4, 0, 0)`, [neighbourIdToUpdate, description, item.gross_weight, weightForDebt]);
           }
       }
     }
 
-    // 3. Process Exchange Items
+    // C. Exchange Items (Old Gold Received)
     if (exchangeItems && exchangeItems.length > 0) {
       for (const ex of exchangeItems) {
         await client.query(
@@ -176,18 +144,79 @@ router.post('/create-bill', async (req, res) => {
   }
 });
 
-// 4. RETURN ITEM
-router.post('/return-item', async (req, res) => {
-    const { sale_item_id, item_id } = req.body;
+// 4. PROCESS RETURN & EXCHANGE (This REPLACES the old 'return-item' logic)
+router.post('/process-return', async (req, res) => {
+    const { sale_id, returned_items, exchange_items, financial_summary } = req.body;
     const client = await pool.connect();
+    
     try {
         await client.query('BEGIN');
-        await client.query("UPDATE sale_items SET item_name = item_name || ' (RETURNED)', total_item_price = 0 WHERE id = $1", [sale_item_id]);
-        if (item_id) {
-            await client.query("UPDATE inventory_items SET status = 'AVAILABLE' WHERE id = $1", [item_id]);
+
+        // A. Create Return Record
+        const returnRes = await client.query(
+            `INSERT INTO sales_returns 
+            (sale_id, total_refund_amount, total_exchange_amount, net_payable_by_customer, net_refundable_to_customer)
+            VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+            [
+                sale_id, 
+                financial_summary.totalRefund, 
+                financial_summary.totalNewPurchase, 
+                financial_summary.netPayable, 
+                financial_summary.netRefundable
+            ]
+        );
+        const returnId = returnRes.rows[0].id;
+
+        // B. Handle Returned Items (Move to In-House Inventory)
+        for (const item of returned_items) {
+            // 1. Log the item in return table
+            await client.query(
+                `INSERT INTO sales_return_items (return_id, sale_item_id, item_name, return_weight, refund_amount)
+                 VALUES ($1, $2, $3, $4, $5)`,
+                [returnId, item.sale_item_id, item.item_name, item.gross_weight, item.refund_amount]
+            );
+
+            // 2. Identify the original inventory item
+            if (item.original_inventory_id) {
+                // UPDATE existing item to be AVAILABLE again
+                // KEY LOGIC: Disconnect from Neighbor (vendor_id=NULL, neighbour_id=NULL)
+                // Set source_type = 'RETURN' so it appears as In-House Stock
+                await client.query(
+                    `UPDATE inventory_items 
+                     SET status = 'AVAILABLE', 
+                         source_type = 'RETURN', 
+                         vendor_id = NULL, 
+                         neighbour_shop_id = NULL,
+                         item_name = $2 
+                     WHERE id = $1`,
+                    [item.original_inventory_id, `${item.item_name} (Returned)`]
+                );
+            } else {
+                // If it was a manual item (no inventory ID), we INSERT it as new stock
+                await client.query(
+                    `INSERT INTO inventory_items 
+                    (item_name, metal_type, gross_weight, status, source_type, vendor_id, date_added)
+                     VALUES ($1, $2, $3, 'AVAILABLE', 'RETURN', NULL, NOW())`,
+                    [item.item_name, 'GOLD', item.gross_weight] 
+                );
+            }
         }
+
+        // C. Process New Items (Exchange/Swap)
+        if (exchange_items && exchange_items.length > 0) {
+            for (const newItem of exchange_items) {
+                if (newItem.id) {
+                     await client.query(
+                        `UPDATE inventory_items SET status = 'SOLD' WHERE id = $1`, 
+                        [newItem.id]
+                    );
+                }
+            }
+        }
+
         await client.query('COMMIT');
-        res.json({ success: true, message: "Item Returned & Added to Inventory" });
+        res.json({ success: true, message: "Return processed successfully" });
+
     } catch (err) {
         await client.query('ROLLBACK');
         res.status(500).json({ error: err.message });
@@ -265,6 +294,16 @@ router.get('/payments/:sale_id', async (req, res) => {
         const result = await pool.query("SELECT * FROM sale_payments WHERE sale_id = $1 ORDER BY payment_date DESC", [req.params.sale_id]);
         res.json(result.rows);
     } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 8. GET BILL HISTORY
+router.get('/history', async (req, res) => {
+    try {
+        const result = await pool.query(`SELECT * FROM sales ORDER BY id DESC`);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 module.exports = router;
