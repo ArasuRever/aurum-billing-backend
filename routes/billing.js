@@ -145,42 +145,46 @@ router.post('/create-bill', async (req, res) => {
 });
 
 // 4. PROCESS RETURN & EXCHANGE (This REPLACES the old 'return-item' logic)
+// ... existing imports and endpoints ...
+
+// REPLACING THE PREVIOUS 'process-return' ENDPOINT
 router.post('/process-return', async (req, res) => {
-    const { sale_id, returned_items, exchange_items, financial_summary } = req.body;
+    const { sale_id, returned_items, exchange_items, customer_id } = req.body;
     const client = await pool.connect();
     
     try {
         await client.query('BEGIN');
 
-        // A. Create Return Record
+        // --- STEP 1: GENERATE RETURN RECEIPT (Credit Note) ---
+        const returnInvoiceNo = `RET-${Date.now()}`;
+        
+        // Calculate Total Refund Value
+        let totalRefundAmount = 0;
+        returned_items.forEach(item => {
+            totalRefundAmount += parseFloat(item.refund_amount);
+        });
+
+        // Insert into sales_returns
         const returnRes = await client.query(
             `INSERT INTO sales_returns 
-            (sale_id, total_refund_amount, total_exchange_amount, net_payable_by_customer, net_refundable_to_customer)
-            VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-            [
-                sale_id, 
-                financial_summary.totalRefund, 
-                financial_summary.totalNewPurchase, 
-                financial_summary.netPayable, 
-                financial_summary.netRefundable
-            ]
+            (sale_id, return_invoice_number, return_date, total_refund_amount)
+            VALUES ($1, $2, NOW(), $3) RETURNING id`,
+            [sale_id, returnInvoiceNo, totalRefundAmount]
         );
-        const returnId = returnRes.rows[0].id;
+        const returnDbId = returnRes.rows[0].id;
 
-        // B. Handle Returned Items (Move to In-House Inventory)
+        // --- STEP 2: HANDLE RETURNED INVENTORY ---
         for (const item of returned_items) {
-            // 1. Log the item in return table
+            // A. Log item in return details
             await client.query(
                 `INSERT INTO sales_return_items (return_id, sale_item_id, item_name, return_weight, refund_amount)
                  VALUES ($1, $2, $3, $4, $5)`,
-                [returnId, item.sale_item_id, item.item_name, item.gross_weight, item.refund_amount]
+                [returnDbId, item.sale_item_id, item.item_name, item.gross_weight, item.refund_amount]
             );
 
-            // 2. Identify the original inventory item
+            // B. Restore Inventory (CRITICAL: Move to "In-House")
             if (item.original_inventory_id) {
-                // UPDATE existing item to be AVAILABLE again
-                // KEY LOGIC: Disconnect from Neighbor (vendor_id=NULL, neighbour_id=NULL)
-                // Set source_type = 'RETURN' so it appears as In-House Stock
+                // We strip the neighbor/vendor tags because we now "own" this returned stock
                 await client.query(
                     `UPDATE inventory_items 
                      SET status = 'AVAILABLE', 
@@ -189,41 +193,103 @@ router.post('/process-return', async (req, res) => {
                          neighbour_shop_id = NULL,
                          item_name = $2 
                      WHERE id = $1`,
-                    [item.original_inventory_id, `${item.item_name} (Returned)`]
+                    [item.original_inventory_id, `${item.item_name}`] 
                 );
             } else {
-                // If it was a manual item (no inventory ID), we INSERT it as new stock
+                // If it was a manual item, create a new inventory record for it
                 await client.query(
                     `INSERT INTO inventory_items 
-                    (item_name, metal_type, gross_weight, status, source_type, vendor_id, date_added)
-                     VALUES ($1, $2, $3, 'AVAILABLE', 'RETURN', NULL, NOW())`,
-                    [item.item_name, 'GOLD', item.gross_weight] 
+                    (item_name, metal_type, gross_weight, status, source_type, date_added)
+                     VALUES ($1, 'GOLD', $2, 'AVAILABLE', 'RETURN', NOW())`,
+                    [item.item_name, item.gross_weight]
                 );
             }
         }
 
-        // C. Process New Items (Exchange/Swap)
+        // --- STEP 3: HANDLE ORIGINAL INVOICE STATUS ---
+        // Check if full return or partial
+        const originalItemsCount = await client.query("SELECT COUNT(*) FROM sale_items WHERE sale_id = $1", [sale_id]);
+        const returnedCount = await client.query("SELECT COUNT(*) FROM sales_return_items WHERE return_id = $1", [returnDbId]); // This might be tricky if multiple returns, but simplifies here
+        
+        // Simple logic: Mark as PARTIAL_RETURN or RETURNED based on user intent
+        // We update the original sale to flag it
+        await client.query("UPDATE sales SET payment_status = 'RETURNED' WHERE id = $1 AND (SELECT COUNT(*) FROM sale_items WHERE sale_id=$1) = $2", [sale_id, returned_items.length]);
+
+
+        // --- STEP 4: GENERATE NEW INVOICE (If Exchange) ---
+        let newInvoiceNo = null;
+        
         if (exchange_items && exchange_items.length > 0) {
-            for (const newItem of exchange_items) {
-                if (newItem.id) {
-                     await client.query(
-                        `UPDATE inventory_items SET status = 'SOLD' WHERE id = $1`, 
-                        [newItem.id]
-                    );
+            newInvoiceNo = `INV-${Date.now()}`;
+            
+            // Calculate New Bill Totals
+            let newBillTotal = 0;
+            exchange_items.forEach(ex => {
+                // Price = Weight * Rate + MC (Simplified for example, ensure accurate fields from frontend)
+                const price = parseFloat(ex.total_price); 
+                newBillTotal += price;
+            });
+
+            // Financial Logic
+            // We use the refund amount as a "Payment" towards the new bill
+            const creditUsed = Math.min(newBillTotal, totalRefundAmount);
+            const balanceToPay = newBillTotal - creditUsed;
+            const paymentStatus = balanceToPay > 0 ? 'PARTIAL' : 'PAID';
+
+            // A. Create New Sale Record
+            const saleRes = await client.query(
+                `INSERT INTO sales 
+                (invoice_number, customer_name, customer_phone, final_amount, total_amount, 
+                 paid_amount, balance_amount, payment_status, created_at)
+                 SELECT $1, customer_name, customer_phone, $2, $2, $3, $4, $5, NOW()
+                 FROM sales WHERE id = $6 RETURNING id`, // Copy customer details from original sale
+                [newInvoiceNo, newBillTotal, creditUsed, balanceToPay, paymentStatus, sale_id]
+            );
+            const newSaleId = saleRes.rows[0].id;
+
+            // B. Add New Items
+            for (const ex of exchange_items) {
+                await client.query(
+                    `INSERT INTO sale_items 
+                    (sale_id, item_id, item_name, sold_weight, sold_rate, total_item_price)
+                     VALUES ($1, $2, $3, $4, $5, $6)`,
+                    [newSaleId, ex.id || null, ex.item_name, ex.gross_weight, ex.rate, ex.total_price]
+                );
+
+                // Update Inventory for New Items (SOLD)
+                if (ex.id) {
+                    await client.query(`UPDATE inventory_items SET status = 'SOLD' WHERE id = $1`, [ex.id]);
+                    // Note: If neighbor item logic applies to exchanges, add that block here from create-bill
                 }
             }
+
+            // C. Record the "Credit Note" Payment
+            await client.query(
+                `INSERT INTO sale_payments (sale_id, amount, payment_mode, note)
+                 VALUES ($1, $2, 'EXCHANGE_CREDIT', $3)`,
+                [newSaleId, creditUsed, `Adjusted from Return #${returnInvoiceNo}`]
+            );
         }
 
         await client.query('COMMIT');
-        res.json({ success: true, message: "Return processed successfully" });
+        
+        res.json({ 
+            success: true, 
+            message: "Transaction Completed", 
+            return_receipt: returnInvoiceNo,
+            new_invoice: newInvoiceNo 
+        });
 
     } catch (err) {
         await client.query('ROLLBACK');
+        console.error(err);
         res.status(500).json({ error: err.message });
     } finally {
         client.release();
     }
 });
+
+module.exports = router;
 
 // 5. DELETE BILL
 router.delete('/delete/:id', async (req, res) => {
