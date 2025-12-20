@@ -1,14 +1,12 @@
+//
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 
 // --- 1. DAILY RATES ENDPOINTS ---
-
-// GET Rates
 router.get('/rates', async (req, res) => {
     try {
         const result = await pool.query("SELECT * FROM daily_rates");
-        // Convert array to object { GOLD: 7000, SILVER: 85 } for easier frontend use
         const rates = {};
         result.rows.forEach(row => {
             rates[row.metal_type] = parseFloat(row.rate);
@@ -19,7 +17,6 @@ router.get('/rates', async (req, res) => {
     }
 });
 
-// UPDATE Rate
 router.post('/rates', async (req, res) => {
     const { metal_type, rate } = req.body;
     try {
@@ -36,37 +33,78 @@ router.post('/rates', async (req, res) => {
     }
 });
 
-// --- 2. MASTER ITEMS ENDPOINTS (Existing) ---
+// --- 2. MASTER ITEMS ENDPOINTS ---
 
 router.get('/items', async (req, res) => {
     try {
-        const result = await pool.query("SELECT * FROM item_masters ORDER BY item_name ASC");
+        const result = await pool.query("SELECT * FROM item_masters ORDER BY id DESC"); // Newest first
         res.json(result.rows);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-router.post('/items', async (req, res) => {
-    // Added calc_method to destructuring
+// NEW: Bulk Add Items
+router.post('/items/bulk', async (req, res) => {
+    const { item_names, metal_type, default_wastage, mc_type, mc_value, calc_method } = req.body;
+    
+    if (!item_names || !Array.isArray(item_names) || item_names.length === 0) {
+        return res.status(400).json({ error: "No item names provided" });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const insertedItems = [];
+
+        for (const name of item_names) {
+            const cleanName = name.trim();
+            if(!cleanName) continue;
+
+            const res = await client.query(
+                `INSERT INTO item_masters 
+                (item_name, metal_type, default_wastage, mc_type, mc_value, calc_method) 
+                 VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+                [
+                    cleanName, 
+                    metal_type, 
+                    default_wastage || 0, 
+                    mc_type || 'FIXED', 
+                    mc_value || 0,
+                    calc_method || 'STANDARD'
+                ]
+            );
+            insertedItems.push(res.rows[0]);
+        }
+        
+        await client.query('COMMIT');
+        res.json({ success: true, count: insertedItems.length, items: insertedItems });
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err);
+        res.status(500).json({ error: "Failed to add items. Some names might be duplicates." });
+    } finally {
+        client.release();
+    }
+});
+
+// NEW: Update Item (Edit)
+router.put('/items/:id', async (req, res) => {
+    const { id } = req.params;
     const { item_name, metal_type, default_wastage, mc_type, mc_value, calc_method } = req.body;
+
     try {
         const result = await pool.query(
-            `INSERT INTO item_masters 
-            (item_name, metal_type, default_wastage, mc_type, mc_value, calc_method) 
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+            `UPDATE item_masters 
+             SET item_name = $1, metal_type = $2, default_wastage = $3, 
+                 mc_type = $4, mc_value = $5, calc_method = $6
+             WHERE id = $7 RETURNING *`,
             [
-                item_name, 
-                metal_type, 
-                default_wastage || 0, 
-                mc_type || 'FIXED', 
-                mc_value || 0,
-                calc_method || 'STANDARD' // Default to Standard logic
+                item_name, metal_type, default_wastage, mc_type, mc_value, calc_method, id
             ]
         );
+        if (result.rows.length === 0) return res.status(404).json({ error: "Item not found" });
         res.json(result.rows[0]);
     } catch (err) {
-        if (err.code === '23505') {
-            return res.status(400).json({ error: "Item name already exists for this metal." });
-        }
         res.status(500).json({ error: err.message });
     }
 });

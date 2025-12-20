@@ -1,6 +1,9 @@
+//
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
+
+// ... existing endpoints (add, list, get, transaction...) ...
 
 // 1. ADD NEW SHOP
 router.post('/add', async (req, res) => {
@@ -23,36 +26,61 @@ router.get('/list', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. GET SHOP DETAILS
-router.get('/:id', async (req, res) => {
-  try {
-    const shopRes = await pool.query('SELECT * FROM external_shops WHERE id = $1', [req.params.id]);
-    const transRes = await pool.query('SELECT * FROM shop_transactions WHERE shop_id = $1 ORDER BY created_at DESC', [req.params.id]);
-    
-    // Fetch aggregated payments per item
-    const paymentRes = await pool.query(`
-        SELECT transaction_id, 
-               SUM(COALESCE(gold_paid, 0) + COALESCE(converted_metal_weight, 0)) as total_gold_paid,
-               SUM(COALESCE(silver_paid, 0)) as total_silver_paid,
-               SUM(COALESCE(cash_paid, 0)) as total_cash_paid
-        FROM shop_transaction_payments
-        GROUP BY transaction_id
-    `);
+// ... [Keep existing get/:id, transaction, etc. unchanged] ...
 
-    const paymentsMap = {};
-    paymentRes.rows.forEach(p => { paymentsMap[p.transaction_id] = p; });
+// [INSERT THIS NEW DELETE ENDPOINT]
+// DELETE SHOP (Only if clean ledger)
+router.delete('/:id', async (req, res) => {
+    const { id } = req.params;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        
+        // A. Check Existence
+        const check = await client.query("SELECT * FROM external_shops WHERE id = $1", [id]);
+        if(check.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({error: "Shop not found"});
+        }
+        const shop = check.rows[0];
 
-    const transactions = transRes.rows.map(t => ({
-        ...t,
-        total_gold_paid: parseFloat(paymentsMap[t.id]?.total_gold_paid || 0),
-        total_silver_paid: parseFloat(paymentsMap[t.id]?.total_silver_paid || 0),
-        total_cash_paid: parseFloat(paymentsMap[t.id]?.total_cash_paid || 0)
-    }));
+        // B. Check Balance (Must be Zero)
+        const g = parseFloat(shop.balance_gold) || 0;
+        const s = parseFloat(shop.balance_silver) || 0;
+        const c = parseFloat(shop.balance_cash) || 0;
+        
+        if (Math.abs(g) > 0.001 || Math.abs(s) > 0.001 || Math.abs(c) > 0.01) {
+             await client.query('ROLLBACK');
+             return res.status(400).json({ error: `Cannot delete: Shop has outstanding balance (G: ${g}, S: ${s}, C: ${c})` });
+        }
+        
+        // C. Check Data History (Transactions)
+        const txnCheck = await client.query("SELECT id FROM shop_transactions WHERE shop_id = $1 LIMIT 1", [id]);
+        if (txnCheck.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "Cannot delete: Shop has transaction history." });
+        }
 
-    res.json({ shop: shopRes.rows[0], transactions: transactions });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+        // D. Delete
+        await client.query("DELETE FROM external_shops WHERE id = $1", [id]);
+        await client.query('COMMIT');
+        res.json({ success: true, message: "Shop deleted" });
+
+    } catch(err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
+    }
 });
 
+// Update Shop Details
+router.put('/:id', async (req, res) => {
+  const { id } = req.params; const { shop_name, nick_id, person_name, mobile, address } = req.body;
+  try { await pool.query(`UPDATE external_shops SET shop_name=$1, nick_id=$2, person_name=$3, mobile=$4, address=$5 WHERE id=$6`, [shop_name, nick_id, person_name, mobile, address, id]); res.json({ success: true, message: 'Shop updated' }); } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ... [Keep transaction endpoints] ...
 // 4. ADD TRANSACTION (Universal Auto-Settlement)
 router.post('/transaction', async (req, res) => {
   const { shop_id, action, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount } = req.body;
@@ -317,9 +345,35 @@ router.post('/settle-item', async (req, res) => {
 router.get('/payment-history/:txnId', async (req, res) => {
     try { const result = await pool.query('SELECT * FROM shop_transaction_payments WHERE transaction_id = $1 ORDER BY created_at DESC', [req.params.txnId]); res.json(result.rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
-router.put('/:id', async (req, res) => {
-  const { id } = req.params; const { shop_name, nick_id, person_name, mobile, address } = req.body;
-  try { await pool.query(`UPDATE external_shops SET shop_name=$1, nick_id=$2, person_name=$3, mobile=$4, address=$5 WHERE id=$6`, [shop_name, nick_id, person_name, mobile, address, id]); res.json({ success: true, message: 'Shop updated' }); } catch (err) { res.status(500).json({ error: err.message }); }
+
+// 3. GET SHOP DETAILS
+router.get('/:id', async (req, res) => {
+  try {
+    const shopRes = await pool.query('SELECT * FROM external_shops WHERE id = $1', [req.params.id]);
+    const transRes = await pool.query('SELECT * FROM shop_transactions WHERE shop_id = $1 ORDER BY created_at DESC', [req.params.id]);
+    
+    // Fetch aggregated payments per item
+    const paymentRes = await pool.query(`
+        SELECT transaction_id, 
+               SUM(COALESCE(gold_paid, 0) + COALESCE(converted_metal_weight, 0)) as total_gold_paid,
+               SUM(COALESCE(silver_paid, 0)) as total_silver_paid,
+               SUM(COALESCE(cash_paid, 0)) as total_cash_paid
+        FROM shop_transaction_payments
+        GROUP BY transaction_id
+    `);
+
+    const paymentsMap = {};
+    paymentRes.rows.forEach(p => { paymentsMap[p.transaction_id] = p; });
+
+    const transactions = transRes.rows.map(t => ({
+        ...t,
+        total_gold_paid: parseFloat(paymentsMap[t.id]?.total_gold_paid || 0),
+        total_silver_paid: parseFloat(paymentsMap[t.id]?.total_silver_paid || 0),
+        total_cash_paid: parseFloat(paymentsMap[t.id]?.total_cash_paid || 0)
+    }));
+
+    res.json({ shop: shopRes.rows[0], transactions: transactions });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 module.exports = router;
