@@ -1,86 +1,117 @@
 const express = require('express');
 const router = express.Router();
-const pool = require('../config/db');
+const pool = require('../config/db'); // Ensure this path matches your db config
 
-// 1. GET COMBINED STATISTICS
+// 1. GET STATS
 router.get('/stats', async (req, res) => {
     try {
-        const direct = await pool.query(`SELECT metal_type, SUM(net_weight) as weight, SUM(amount_paid) as cost FROM old_metal_purchases GROUP BY metal_type`);
-        const exchange = await pool.query(`SELECT metal_type, SUM(net_weight) as weight, SUM(total_amount) as cost FROM sale_exchange_items GROUP BY metal_type`);
+        // Calculate total weight and cost for Gold and Silver
+        const goldStats = await pool.query(`
+            SELECT COALESCE(SUM(net_weight), 0) as weight, COALESCE(SUM(amount), 0) as cost 
+            FROM old_metal_items WHERE metal_type = 'GOLD'
+        `);
+        const silverStats = await pool.query(`
+            SELECT COALESCE(SUM(net_weight), 0) as weight, COALESCE(SUM(amount), 0) as cost 
+            FROM old_metal_items WHERE metal_type = 'SILVER'
+        `);
 
-        const totals = { gold_weight: 0, gold_cost: 0, silver_weight: 0, silver_cost: 0 };
-        
-        [...direct.rows, ...exchange.rows].forEach(row => {
-            if(row.metal_type === 'GOLD') {
-                totals.gold_weight += parseFloat(row.weight || 0);
-                totals.gold_cost += parseFloat(row.cost || 0);
-            } else if(row.metal_type === 'SILVER') {
-                totals.silver_weight += parseFloat(row.weight || 0);
-                totals.silver_cost += parseFloat(row.cost || 0);
-            }
+        res.json({
+            gold_weight: goldStats.rows[0].weight,
+            gold_cost: goldStats.rows[0].cost,
+            silver_weight: silverStats.rows[0].weight,
+            silver_cost: silverStats.rows[0].cost
         });
-        res.json(totals);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Server Error' });
+    }
 });
 
-// 2. GET HISTORY
+// 2. GET LIST (HISTORY)
 router.get('/list', async (req, res) => {
     try {
-        const query = `
-            SELECT id, 'DIRECT_PURCHASE' as source, customer_name, mobile, item_name, metal_type, net_weight, amount_paid as amount, created_at as date, voucher_no 
-            FROM old_metal_purchases
-            UNION ALL
-            SELECT e.id, 'BILL_EXCHANGE' as source, s.customer_name, s.customer_phone as mobile, e.item_name, e.metal_type, e.net_weight, e.total_amount as amount, s.created_at as date, s.invoice_number as voucher_no
-            FROM sale_exchange_items e JOIN sales s ON e.sale_id = s.id
-            ORDER BY date DESC LIMIT 200
-        `;
-        const result = await pool.query(query);
+        // Fetch Purchases joined with Items for a flattened view (or just purchases)
+        const result = await pool.query(`
+            SELECT p.id, p.voucher_no, p.customer_name, p.mobile, p.date, 
+                   i.item_name, i.metal_type, i.net_weight, i.amount, p.net_payout
+            FROM old_metal_purchases p
+            JOIN old_metal_items i ON p.id = i.purchase_id
+            ORDER BY p.date DESC
+        `);
         res.json(result.rows);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Server Error' });
+    }
 });
 
-// 3. ADD MULTI-ITEM PURCHASE
+// 3. ADD PURCHASE
 router.post('/purchase', async (req, res) => {
-    const { customer_name, mobile, items, total_amount, gst_deducted, net_payout } = req.body;
     const client = await pool.connect();
-    
     try {
         await client.query('BEGIN');
-        const voucherNo = `PUR-${Date.now()}`;
-        
-        // A. Insert Each Item
-        for (const item of items) {
-             await client.query(
-                `INSERT INTO old_metal_purchases 
-                (voucher_no, customer_name, mobile, item_name, metal_type, gross_weight, less_percent, less_weight, net_weight, rate, amount_paid)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-                [
-                    voucherNo, customer_name, mobile, 
-                    item.item_name, item.metal_type, 
-                    item.gross_weight, item.less_percent, item.less_weight, item.net_weight, 
-                    item.rate, item.amount // This is the ITEM value (before global GST split)
-                ]
-            );
-        }
+        const { customer_name, mobile, items, total_amount, gst_deducted, net_payout, payment_mode, cash_paid, online_paid } = req.body;
 
-        // B. Update Ledger (Money Out)
-        if (parseFloat(net_payout) > 0) {
-            await client.query(`UPDATE shop_assets SET cash_balance = cash_balance - $1 WHERE id = 1`, [net_payout]);
-            
-            // Log Expense
-            await client.query(
-                `INSERT INTO general_expenses (description, amount, category, payment_mode) 
-                 VALUES ($1, $2, 'OLD_METAL_PURCHASE', 'CASH')`,
-                [`Bought Old Metal (${items.length} items) - Voucher ${voucherNo}`, net_payout]
+        // Generate Voucher No (Simple Auto-increment logic or timestamp)
+        const voucherRes = await client.query("SELECT COUNT(*) FROM old_metal_purchases");
+        const count = parseInt(voucherRes.rows[0].count) + 1;
+        const voucher_no = `OM-${new Date().getFullYear()}-${String(count).padStart(4, '0')}`;
+
+        // Insert Purchase Record
+        const purchaseRes = await client.query(`
+            INSERT INTO old_metal_purchases 
+            (voucher_no, customer_name, mobile, total_amount, gst_deducted, net_payout, payment_mode, cash_paid, online_paid, date)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+            RETURNING id`,
+            [voucher_no, customer_name, mobile, total_amount, gst_deducted, net_payout, payment_mode, cash_paid, online_paid]
+        );
+        const purchaseId = purchaseRes.rows[0].id;
+
+        // Insert Items
+        for (const item of items) {
+            await client.query(`
+                INSERT INTO old_metal_items 
+                (purchase_id, item_name, metal_type, gross_weight, less_percent, less_weight, net_weight, rate, amount)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                [purchaseId, item.item_name, item.metal_type, item.gross_weight, item.less_percent, item.less_weight, item.net_weight, item.rate, item.amount]
             );
         }
 
         await client.query('COMMIT');
-        res.json({ success: true, voucher_no: voucherNo });
-
+        res.json({ message: 'Purchase Saved', voucher_no });
     } catch (err) {
         await client.query('ROLLBACK');
-        res.status(500).json({ error: err.message });
+        console.error(err);
+        res.status(500).json({ error: 'Transaction Failed' });
+    } finally {
+        client.release();
+    }
+});
+
+// 4. DELETE PURCHASE (This fixes your 404 error)
+router.delete('/:id', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const { id } = req.params;
+
+        // First delete items linked to this purchase (Foreign Key constraint)
+        await client.query('DELETE FROM old_metal_items WHERE purchase_id = $1', [id]);
+
+        // Then delete the purchase record itself
+        const result = await client.query('DELETE FROM old_metal_purchases WHERE id = $1', [id]);
+
+        if (result.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ message: "Record not found" });
+        }
+
+        await client.query('COMMIT');
+        res.json({ message: "Deleted successfully" });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error("Delete Error:", err);
+        res.status(500).json({ message: "Server error during deletion" });
     } finally {
         client.release();
     }
