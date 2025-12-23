@@ -105,7 +105,7 @@ router.get('/:id/transactions', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 9. MANUAL LEDGER TRANSACTION (Fixed: Safe Number Handling)
+// 9. MANUAL LEDGER TRANSACTION (Fixed: Safe Number Handling & Ledger Update)
 router.post('/transaction', async (req, res) => {
     const { vendor_id, type, description, metal_weight, cash_amount, conversion_rate } = req.body;
     const client = await pool.connect();
@@ -131,6 +131,15 @@ router.post('/transaction', async (req, res) => {
         if (safeCash > 0 && safeRate > 0) {
           cashConverted = safeCash / safeRate;
           pureImpact -= cashConverted;
+        }
+
+        // --- NEW: UPDATE MASTER LEDGER (Shop Assets) ---
+        // If we are paying cash to vendor, our Cash Balance decreases.
+        if (safeCash > 0) {
+            await client.query(
+                `UPDATE shop_assets SET cash_balance = cash_balance - $1 WHERE id = 1`,
+                [safeCash]
+            );
         }
       }
 
