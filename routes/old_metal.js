@@ -1,96 +1,89 @@
-import React from 'react';
+const express = require('express');
+const router = express.Router();
+const pool = require('../config/db');
 
-const OldMetalReceipt = React.forwardRef(({ data }, ref) => {
-  if (!data) return null;
+// 1. GET COMBINED STATISTICS
+router.get('/stats', async (req, res) => {
+    try {
+        const direct = await pool.query(`SELECT metal_type, SUM(net_weight) as weight, SUM(amount_paid) as cost FROM old_metal_purchases GROUP BY metal_type`);
+        const exchange = await pool.query(`SELECT metal_type, SUM(net_weight) as weight, SUM(total_amount) as cost FROM sale_exchange_items GROUP BY metal_type`);
 
-  const { customer, items, totals, voucherNo } = data;
-
-  return (
-    <div ref={ref} className="p-4" style={{ fontFamily: 'monospace', color: '#000', backgroundColor: '#fff' }}>
-      {/* HEADER */}
-      <div className="text-center mb-4 border-bottom pb-3">
-        <h3 className="fw-bold m-0">AURUM JEWELLERY</h3>
-        <p className="m-0 small">Main Market, Salem - 636001</p>
-        <p className="m-0 small">Phone: 98765 43210</p>
-        <h5 className="mt-2 text-decoration-underline">OLD METAL PURCHASE VOUCHER</h5>
-      </div>
-
-      {/* INFO */}
-      <div className="d-flex justify-content-between mb-3 small">
-        <div>
-            <div><strong>Voucher No:</strong> {voucherNo}</div>
-            <div><strong>Date:</strong> {new Date().toLocaleString()}</div>
-        </div>
-        <div className="text-end">
-            <div><strong>Customer:</strong> {customer.customer_name}</div>
-            <div><strong>Mobile:</strong> {customer.mobile}</div>
-        </div>
-      </div>
-
-      {/* TABLE */}
-      <table className="table table-bordered table-sm small border-dark">
-        <thead className="table-light">
-          <tr>
-            <th>#</th>
-            <th>Item</th>
-            <th>Type</th>
-            <th className="text-end">Gross</th>
-            <th className="text-end">Less</th>
-            <th className="text-end">Net Wt</th>
-            <th className="text-end">Rate</th>
-            <th className="text-end">Value</th>
-          </tr>
-        </thead>
-        <tbody>
-          {items.map((item, i) => (
-            <tr key={i}>
-              <td>{i + 1}</td>
-              <td>{item.item_name}</td>
-              <td>{item.metal_type}</td>
-              <td className="text-end">{parseFloat(item.gross_weight).toFixed(3)}</td>
-              <td className="text-end">
-                  {parseFloat(item.less_weight).toFixed(3)} <br/>
-                  <span className="text-muted" style={{fontSize: '0.8em'}}>({item.less_percent}%)</span>
-              </td>
-              <td className="text-end fw-bold">{parseFloat(item.net_weight).toFixed(3)}</td>
-              <td className="text-end">{item.rate}</td>
-              <td className="text-end">{parseFloat(item.amount).toLocaleString()}</td>
-            </tr>
-          ))}
-        </tbody>
-        <tfoot className="fw-bold">
-            <tr>
-                <td colSpan="7" className="text-end">Sub Total</td>
-                <td className="text-end">₹{totals.totalAmount.toLocaleString()}</td>
-            </tr>
-            {totals.gstAmount > 0 && (
-                <tr>
-                    <td colSpan="7" className="text-end">Less: GST Deduction</td>
-                    <td className="text-end text-danger">- ₹{totals.gstAmount.toLocaleString()}</td>
-                </tr>
-            )}
-            <tr className="fs-6">
-                <td colSpan="7" className="text-end">NET PAYABLE CASH</td>
-                <td className="text-end">₹{totals.netPayout.toLocaleString()}</td>
-            </tr>
-        </tfoot>
-      </table>
-
-      {/* FOOTER */}
-      <div className="row mt-5 pt-4">
-        <div className="col-6 text-center">
-            <div className="border-top border-dark w-75 mx-auto pt-2">Customer Signature</div>
-        </div>
-        <div className="col-6 text-center">
-            <div className="border-top border-dark w-75 mx-auto pt-2">Authorized Signatory</div>
-        </div>
-      </div>
-      
-      <div className="text-center mt-4 small text-muted">
-          * This is a computer generated voucher.
-      </div>
-    </div>
-  );
+        const totals = { gold_weight: 0, gold_cost: 0, silver_weight: 0, silver_cost: 0 };
+        
+        [...direct.rows, ...exchange.rows].forEach(row => {
+            if(row.metal_type === 'GOLD') {
+                totals.gold_weight += parseFloat(row.weight || 0);
+                totals.gold_cost += parseFloat(row.cost || 0);
+            } else if(row.metal_type === 'SILVER') {
+                totals.silver_weight += parseFloat(row.weight || 0);
+                totals.silver_cost += parseFloat(row.cost || 0);
+            }
+        });
+        res.json(totals);
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-export default OldMetalReceipt;
+// 2. GET HISTORY
+router.get('/list', async (req, res) => {
+    try {
+        const query = `
+            SELECT id, 'DIRECT_PURCHASE' as source, customer_name, mobile, item_name, metal_type, net_weight, amount_paid as amount, created_at as date, voucher_no 
+            FROM old_metal_purchases
+            UNION ALL
+            SELECT e.id, 'BILL_EXCHANGE' as source, s.customer_name, s.customer_phone as mobile, e.item_name, e.metal_type, e.net_weight, e.total_amount as amount, s.created_at as date, s.invoice_number as voucher_no
+            FROM sale_exchange_items e JOIN sales s ON e.sale_id = s.id
+            ORDER BY date DESC LIMIT 200
+        `;
+        const result = await pool.query(query);
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 3. ADD MULTI-ITEM PURCHASE
+router.post('/purchase', async (req, res) => {
+    const { customer_name, mobile, items, total_amount, gst_deducted, net_payout } = req.body;
+    const client = await pool.connect();
+    
+    try {
+        await client.query('BEGIN');
+        const voucherNo = `PUR-${Date.now()}`;
+        
+        // A. Insert Each Item
+        for (const item of items) {
+             await client.query(
+                `INSERT INTO old_metal_purchases 
+                (voucher_no, customer_name, mobile, item_name, metal_type, gross_weight, less_percent, less_weight, net_weight, rate, amount_paid)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+                [
+                    voucherNo, customer_name, mobile, 
+                    item.item_name, item.metal_type, 
+                    item.gross_weight, item.less_percent, item.less_weight, item.net_weight, 
+                    item.rate, item.amount // This is the ITEM value (before global GST split)
+                ]
+            );
+        }
+
+        // B. Update Ledger (Money Out)
+        if (parseFloat(net_payout) > 0) {
+            await client.query(`UPDATE shop_assets SET cash_balance = cash_balance - $1 WHERE id = 1`, [net_payout]);
+            
+            // Log Expense
+            await client.query(
+                `INSERT INTO general_expenses (description, amount, category, payment_mode) 
+                 VALUES ($1, $2, 'OLD_METAL_PURCHASE', 'CASH')`,
+                [`Bought Old Metal (${items.length} items) - Voucher ${voucherNo}`, net_payout]
+            );
+        }
+
+        await client.query('COMMIT');
+        res.json({ success: true, voucher_no: voucherNo });
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+module.exports = router;
