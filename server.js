@@ -20,9 +20,10 @@ app.use('/api/billing', require('./routes/billing'));
 app.use('/api/shops', require('./routes/shops'));
 app.use('/api/settings', require('./routes/settings'));
 app.use('/api/ledger', require('./routes/ledger'));
+app.use('/api/old-metal', require('./routes/old_metal'));
 
 // --- NEW ROUTE ---
-app.use('/api/old-metal', require('./routes/old_metal'));
+app.use('/api/refinery', require('./routes/refinery'));
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);

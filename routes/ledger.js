@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 
-// 1. GET DASHBOARD STATS
+// 1. GET DASHBOARD STATS (Assets Only)
 router.get('/stats', async (req, res) => {
     try {
         const assets = await pool.query("SELECT * FROM shop_assets WHERE id = 1");
@@ -11,7 +11,6 @@ router.get('/stats', async (req, res) => {
         todayStart.setHours(0,0,0,0);
         
         const salesToday = await pool.query("SELECT SUM(amount) as total FROM sale_payments WHERE payment_date >= $1", [todayStart]);
-        
         const expensesToday = await pool.query("SELECT SUM(amount) as total FROM general_expenses WHERE created_at >= $1 AND category != 'MANUAL_INCOME'", [todayStart]);
 
         res.json({
@@ -22,68 +21,151 @@ router.get('/stats', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. GET MASTER HISTORY (Updated Vendor Mode Logic)
+// 2. GET MASTER HISTORY (SAFE MODE)
+// This version uses NULL placeholders for columns that might be missing in your DB
 router.get('/history', async (req, res) => {
-    const { search } = req.query;
+    const { date, search } = req.query; 
+    
     try {
         const searchTerm = search ? `%${search}%` : null;
+        
+        // Date Filter Logic
+        let dateFilter = '1=1';
+        if (date) {
+            dateFilter = `DATE(date) = '${date}'`;
+        }
 
         const query = `
             WITH all_txns AS (
                 -- 1. SALES
-                SELECT id, 'SALE_INCOME' as type, note as description, amount as cash_amount, 
-                       0 as gold_weight, 0 as silver_weight, 
-                       payment_mode, payment_date as date, 'IN' as direction 
+                SELECT id, 
+                       'SALE_INCOME' as type, 
+                       note as description, 
+                       amount as cash_amount, 
+                       0::numeric as gold_weight, 
+                       0::numeric as silver_weight, 
+                       payment_mode, 
+                       payment_date as date, 
+                       'IN' as direction,
+                       NULL::integer as reference_id, 
+                       NULL::text as reference_type
                 FROM sale_payments
                 
                 UNION ALL
                 
-                -- 2. VENDORS (Fixed: Show STOCK instead of CASH for inventory adds)
-                SELECT id, 'VENDOR_TXN' as type, description, repaid_cash_amount as cash_amount, 
-                       (stock_pure_weight + repaid_metal_weight) as gold_weight, 0 as silver_weight,
+                -- 2. VENDORS (SAFE MODE: Using NULL for reference columns to prevent crash)
+                SELECT id, 
+                       'VENDOR_TXN' as type, 
+                       description, 
+                       repaid_cash_amount as cash_amount, 
+                       CASE WHEN metal_type = 'GOLD' THEN (stock_pure_weight + repaid_metal_weight) ELSE 0 END as gold_weight, 
+                       CASE WHEN metal_type = 'SILVER' THEN (stock_pure_weight + repaid_metal_weight) ELSE 0 END as silver_weight,
                        CASE WHEN repaid_cash_amount > 0 THEN 'CASH' ELSE 'STOCK' END as payment_mode, 
                        created_at as date, 
-                       CASE WHEN repaid_cash_amount > 0 THEN 'OUT' ELSE 'IN' END as direction
+                       CASE WHEN repaid_cash_amount > 0 THEN 'OUT' ELSE 'IN' END as direction,
+                       NULL::integer as reference_id, 
+                       NULL::text as reference_type
                 FROM vendor_transactions 
                 WHERE repaid_cash_amount > 0 OR stock_pure_weight > 0 OR repaid_metal_weight > 0
                 
                 UNION ALL
                 
                 -- 3. SHOP B2B
-                SELECT id, 'SHOP_B2B' as type, description, cash_amount, 
-                       pure_weight as gold_weight, silver_weight as silver_weight,
-                       'CASH' as payment_mode, created_at as date,
-                       CASE WHEN type IN ('BORROW_ADD', 'LEND_COLLECT') THEN 'IN' ELSE 'OUT' END as direction
+                SELECT id, 
+                       'SHOP_B2B' as type, 
+                       description, 
+                       cash_amount, 
+                       pure_weight as gold_weight, 
+                       silver_weight as silver_weight,
+                       'CASH' as payment_mode, 
+                       created_at as date,
+                       CASE WHEN type IN ('BORROW_ADD', 'LEND_COLLECT') THEN 'IN' ELSE 'OUT' END as direction,
+                       NULL::integer as reference_id, 
+                       NULL::text as reference_type
                 FROM shop_transactions 
-                WHERE cash_amount > 0 OR pure_weight > 0 OR silver_weight > 0
                 
                 UNION ALL
                 
                 -- 4. GENERAL EXPENSES
-                SELECT id, 'EXPENSE' as type, description, amount as cash_amount, 
-                       0 as gold_weight, 0 as silver_weight, 
-                       payment_mode, created_at as date, 
-                       CASE WHEN category = 'MANUAL_INCOME' THEN 'IN' ELSE 'OUT' END as direction
+                SELECT id, 
+                       'EXPENSE' as type, 
+                       description, 
+                       amount as cash_amount, 
+                       0::numeric as gold_weight, 
+                       0::numeric as silver_weight, 
+                       payment_mode, 
+                       created_at as date, 
+                       CASE WHEN category = 'MANUAL_INCOME' THEN 'IN' ELSE 'OUT' END as direction,
+                       NULL::integer as reference_id, 
+                       NULL::text as reference_type
                 FROM general_expenses
-                
+
                 UNION ALL
 
                 -- 5. OLD METAL
-                SELECT id, 'OLD_METAL' as type, CONCAT('Bought from ', customer_name, ' (', voucher_no, ')') as description, 
+                SELECT id, 
+                       'OLD_METAL' as type, 
+                       CONCAT('Bought from ', customer_name, ' (', voucher_no, ')') as description, 
                        net_payout as cash_amount, 
-                       0 as gold_weight, 0 as silver_weight,
-                       payment_mode, date, 
-                       'OUT' as direction
+                       0::numeric as gold_weight, 
+                       0::numeric as silver_weight,
+                       payment_mode, 
+                       date, 
+                       'OUT' as direction,
+                       NULL::integer as reference_id, 
+                       NULL::text as reference_type
                 FROM old_metal_purchases
+
+                UNION ALL
+                
+                -- 6. REFINERY
+                SELECT id, 
+                       'REFINERY' as type, 
+                       CONCAT('Refinery Batch ', batch_no) as description,
+                       0::numeric as cash_amount,
+                       CASE WHEN metal_type='GOLD' THEN gross_weight ELSE 0 END as gold_weight,
+                       CASE WHEN metal_type='SILVER' THEN gross_weight ELSE 0 END as silver_weight,
+                       'STOCK' as payment_mode, 
+                       sent_date as date,
+                       'OUT' as direction,
+                       id as reference_id, 
+                       'REFINERY_BATCH' as reference_type
+                FROM refinery_batches
             )
             SELECT * FROM all_txns
-            WHERE ($1::text IS NULL OR description ILIKE $1 OR type ILIKE $1)
-            ORDER BY date DESC LIMIT 300
+            WHERE (${dateFilter}) 
+            AND ($1::text IS NULL OR description ILIKE $1 OR type ILIKE $1)
+            ORDER BY date DESC
         `;
         
         const result = await pool.query(query, [searchTerm]);
-        res.json(result.rows);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+        
+        // Calculate Day Stats
+        let dayStats = { income: 0, expense: 0, gold_in: 0, gold_out: 0, silver_in: 0, silver_out: 0 };
+        
+        result.rows.forEach(row => {
+            const amt = parseFloat(row.cash_amount || 0);
+            const gw = parseFloat(row.gold_weight || 0);
+            const sw = parseFloat(row.silver_weight || 0);
+
+            if (amt > 0) {
+                if(row.direction === 'IN') dayStats.income += amt;
+                else dayStats.expense += amt;
+            }
+            if(row.direction === 'IN') {
+                dayStats.gold_in += gw;
+                dayStats.silver_in += sw;
+            } else {
+                dayStats.gold_out += gw;
+                dayStats.silver_out += sw;
+            }
+        });
+
+        res.json({ transactions: result.rows, dayStats });
+    } catch (err) { 
+        console.error("Ledger History Error:", err);
+        res.status(500).json({ error: err.message }); 
+    }
 });
 
 // 3. ADD EXPENSE

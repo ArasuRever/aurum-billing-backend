@@ -1,4 +1,3 @@
-//
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
@@ -7,12 +6,11 @@ const multer = require('multer');
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// 1. ADD ITEM (Now correctly updates Vendor Balance)
+// 1. ADD ITEM (Single) - Kept for legacy compatibility
 router.post('/add', upload.single('item_image'), async (req, res) => {
   const { 
     vendor_id, neighbour_shop_id, source_type, 
-    metal_type, item_name, gross_weight, wastage_percent, making_charges, stock_type,
-    huid // <--- NEW FIELD
+    metal_type, item_name, gross_weight, wastage_percent, making_charges, stock_type, huid 
   } = req.body;
   
   const item_image = req.file ? req.file.buffer : null;
@@ -21,17 +19,12 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Default Source if missing
     const finalSource = source_type || 'VENDOR'; 
-    
     const prefix = metal_type === 'GOLD' ? 'G' : 'S';
     const barcode = `${prefix}-${Date.now()}`;
     const gross = parseFloat(gross_weight) || 0;
     const purityVal = parseFloat(wastage_percent) || 0; 
     
-    // CALCULATION LOGIC:
-    // If frontend sends 'pure_weight', use it (it handles the Touch vs Wastage logic).
-    // Otherwise fallback to standard Touch logic: Gross * (Purity / 100).
     let pure_weight = 0;
     if (req.body.pure_weight) {
         pure_weight = parseFloat(req.body.pure_weight);
@@ -39,41 +32,99 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
         pure_weight = gross * (purityVal / 100);
     }
 
-    // 2. Insert into Inventory
+    // Insert Item
     const itemRes = await client.query(
       `INSERT INTO inventory_items 
       (vendor_id, neighbour_shop_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, item_image, status, stock_type, huid)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'AVAILABLE', $12, $13) RETURNING *`,
-      [
-        vendor_id || null, 
-        neighbour_shop_id || null, 
-        finalSource, 
-        metal_type, item_name, barcode, gross, purityVal, making_charges, pure_weight, item_image, 
-        stock_type || 'SINGLE',
-        huid || null // <--- Insert HUID
-      ]
+      [vendor_id || null, neighbour_shop_id || null, finalSource, metal_type, item_name, barcode, gross, purityVal, making_charges, pure_weight, item_image, stock_type || 'SINGLE', huid || null]
     );
     const newItem = itemRes.rows[0];
 
-    // 3. IF VENDOR -> Update Vendor Ledger
+    // Update Vendor Ledger (Pass metal_type explicitly)
     if (finalSource === 'VENDOR' && vendor_id) {
-        // A. Increase Vendor Balance
         await client.query(
             `UPDATE vendors SET balance_pure_weight = balance_pure_weight + $1 WHERE id = $2`,
             [pure_weight, vendor_id]
         );
         
-        // B. Add Transaction Entry
         await client.query(
             `INSERT INTO vendor_transactions 
-            (vendor_id, type, description, stock_pure_weight, balance_after)
-             VALUES ($1, 'STOCK_ADDED', $2, $3, (SELECT balance_pure_weight FROM vendors WHERE id=$1))`,
-            [vendor_id, `Added Stock: ${item_name}`, pure_weight]
+            (vendor_id, type, description, stock_pure_weight, balance_after, metal_type)
+             VALUES ($1, 'STOCK_ADDED', $2, $3, (SELECT balance_pure_weight FROM vendors WHERE id=$1), $4)`,
+            [vendor_id, `Added Stock: ${item_name}`, pure_weight, metal_type]
         );
     }
     
     await client.query('COMMIT');
     res.json({ success: true, item: newItem });
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// --- NEW: BATCH STOCK ENTRY (Grid System) ---
+router.post('/batch-add', async (req, res) => {
+  const { vendor_id, metal_type, invoice_no, items } = req.body; 
+  // items: [{ item_name, gross_weight, wastage_percent, making_charges, huid }, ...]
+  
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Create Batch Wrapper
+    let totalGross = 0;
+    let totalPure = 0;
+    
+    // Pre-calculate totals
+    items.forEach(i => {
+        const g = parseFloat(i.gross_weight) || 0;
+        const p = parseFloat(i.wastage_percent) || 0;
+        totalGross += g;
+        totalPure += (g * (p/100));
+    });
+
+    const batchRes = await client.query(
+        `INSERT INTO stock_batches (vendor_id, invoice_no, metal_type, total_gross_weight, total_pure_weight, item_count)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [vendor_id, invoice_no, metal_type, totalGross, totalPure, items.length]
+    );
+    const batchId = batchRes.rows[0].id;
+
+    // 2. Insert Items
+    for (const item of items) {
+        const barcode = `${metal_type.charAt(0)}-${Date.now()}-${Math.floor(Math.random()*1000)}`;
+        const g = parseFloat(item.gross_weight) || 0;
+        const p = parseFloat(item.wastage_percent) || 0;
+        const pure = g * (p/100);
+
+        await client.query(
+            `INSERT INTO inventory_items 
+            (vendor_id, batch_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, status, stock_type, huid)
+            VALUES ($1, $2, 'VENDOR', $3, $4, $5, $6, $7, $8, $9, 'AVAILABLE', 'SINGLE', $10)`,
+            [vendor_id, batchId, metal_type, item.item_name, barcode, g, p, item.making_charges, pure, item.huid || null]
+        );
+    }
+
+    // 3. Update Vendor Balance (One Consolidated Entry)
+    await client.query(
+        `UPDATE vendors SET balance_pure_weight = balance_pure_weight + $1 WHERE id = $2`,
+        [totalPure, vendor_id]
+    );
+
+    await client.query(
+        `INSERT INTO vendor_transactions 
+        (vendor_id, type, description, stock_pure_weight, balance_after, metal_type, reference_id, reference_type)
+         VALUES ($1, 'STOCK_ADDED', $2, $3, (SELECT balance_pure_weight FROM vendors WHERE id=$1), $4, $5, 'BATCH')`,
+        [vendor_id, `Inv #${invoice_no}: Added ${items.length} Items`, totalPure, metal_type, batchId]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, batchId });
 
   } catch (err) {
     await client.query('ROLLBACK');
@@ -117,23 +168,15 @@ router.get('/vendor/:id', async (req, res) => {
 router.put('/update/:id', async (req, res) => {
   const { id } = req.params;
   const { gross_weight, wastage_percent, update_comment } = req.body;
-  
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    
     const oldRes = await client.query('SELECT * FROM inventory_items WHERE id = $1', [id]);
     const oldItem = oldRes.rows[0];
-    
     const newGross = parseFloat(gross_weight);
     const newPurity = parseFloat(wastage_percent);
-    
-    // Note: Update usually assumes Touch logic for simplicity unless we store calculation mode.
-    // Defaulting to Touch logic here for consistency with legacy, or calculated pure should be passed.
-    // For now, retaining standard formula: Gross * (Percent / 100)
     const newPure = newGross * (newPurity / 100); 
     const oldPure = parseFloat(oldItem.pure_weight);
-    
     const diffPure = newPure - oldPure;
 
     await client.query(`INSERT INTO item_updates (item_id, old_values, update_comment) VALUES ($1, $2, $3)`, [id, JSON.stringify(oldItem), update_comment]);
@@ -142,12 +185,11 @@ router.put('/update/:id', async (req, res) => {
     if (oldItem.vendor_id && diffPure !== 0) {
         await client.query(`UPDATE vendors SET balance_pure_weight = balance_pure_weight + $1 WHERE id = $2`, [diffPure, oldItem.vendor_id]);
         await client.query(
-            `INSERT INTO vendor_transactions (vendor_id, type, description, stock_pure_weight, balance_after)
-             VALUES ($1, 'STOCK_UPDATE', $2, $3, (SELECT balance_pure_weight FROM vendors WHERE id=$1))`,
-            [oldItem.vendor_id, `Updated Item: ${oldItem.item_name}`, diffPure]
+            `INSERT INTO vendor_transactions (vendor_id, type, description, stock_pure_weight, balance_after, metal_type)
+             VALUES ($1, 'STOCK_UPDATE', $2, $3, (SELECT balance_pure_weight FROM vendors WHERE id=$1), $4)`,
+            [oldItem.vendor_id, `Updated Item: ${oldItem.item_name}`, diffPure, oldItem.metal_type]
         );
     }
-
     await client.query('COMMIT');
     res.json({ success: true });
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
@@ -164,14 +206,13 @@ router.delete('/:id', async (req, res) => {
     
     if (item) {
         await client.query('DELETE FROM inventory_items WHERE id = $1', [id]);
-
         if (item.source_type === 'VENDOR' && item.vendor_id) {
             const reduction = parseFloat(item.pure_weight) || 0;
             await client.query('UPDATE vendors SET balance_pure_weight = balance_pure_weight - $1 WHERE id = $2', [reduction, item.vendor_id]);
             await client.query(
-              `INSERT INTO vendor_transactions (vendor_id, type, description, stock_pure_weight, repaid_metal_weight, balance_after)
-               VALUES ($1, 'REPAYMENT', $2, 0, $3, (SELECT balance_pure_weight FROM vendors WHERE id=$1))`,
-              [item.vendor_id, `Deleted: ${item.item_name}`, reduction]
+              `INSERT INTO vendor_transactions (vendor_id, type, description, stock_pure_weight, repaid_metal_weight, balance_after, metal_type)
+               VALUES ($1, 'REPAYMENT', $2, 0, $3, (SELECT balance_pure_weight FROM vendors WHERE id=$1), $4)`,
+              [item.vendor_id, `Deleted: ${item.item_name}`, reduction, item.metal_type]
             );
         }
     }
