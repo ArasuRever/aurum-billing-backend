@@ -12,7 +12,6 @@ router.get('/stats', async (req, res) => {
         
         const salesToday = await pool.query("SELECT SUM(amount) as total FROM sale_payments WHERE payment_date >= $1", [todayStart]);
         
-        // Exclude MANUAL_INCOME from expenses total
         const expensesToday = await pool.query("SELECT SUM(amount) as total FROM general_expenses WHERE created_at >= $1 AND category != 'MANUAL_INCOME'", [todayStart]);
 
         res.json({
@@ -23,7 +22,7 @@ router.get('/stats', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. GET MASTER HISTORY (Searchable & Split Metals)
+// 2. GET MASTER HISTORY (Updated with Old Metal)
 router.get('/history', async (req, res) => {
     const { search } = req.query;
     try {
@@ -39,7 +38,7 @@ router.get('/history', async (req, res) => {
                 
                 UNION ALL
                 
-                -- 2. VENDORS (Treating as Gold/Pure)
+                -- 2. VENDORS
                 SELECT id, 'VENDOR_TXN' as type, description, repaid_cash_amount as cash_amount, 
                        (stock_pure_weight + repaid_metal_weight) as gold_weight, 0 as silver_weight,
                        'CASH' as payment_mode, created_at as date, 
@@ -49,7 +48,7 @@ router.get('/history', async (req, res) => {
                 
                 UNION ALL
                 
-                -- 3. SHOP B2B (Gold & Silver)
+                -- 3. SHOP B2B
                 SELECT id, 'SHOP_B2B' as type, description, cash_amount, 
                        pure_weight as gold_weight, silver_weight as silver_weight,
                        'CASH' as payment_mode, created_at as date,
@@ -59,12 +58,22 @@ router.get('/history', async (req, res) => {
                 
                 UNION ALL
                 
-                -- 4. GENERAL EXPENSES & MANUAL LOGS
+                -- 4. GENERAL EXPENSES
                 SELECT id, 'EXPENSE' as type, description, amount as cash_amount, 
                        0 as gold_weight, 0 as silver_weight, 
                        payment_mode, created_at as date, 
                        CASE WHEN category = 'MANUAL_INCOME' THEN 'IN' ELSE 'OUT' END as direction
                 FROM general_expenses
+
+                UNION ALL
+
+                -- 5. OLD METAL PURCHASES (New Section)
+                SELECT id, 'OLD_METAL' as type, CONCAT('Bought from ', customer_name, ' (', voucher_no, ')') as description, 
+                       net_payout as cash_amount, 
+                       0 as gold_weight, 0 as silver_weight,
+                       payment_mode, date, 
+                       'OUT' as direction
+                FROM old_metal_purchases
             )
             SELECT * FROM all_txns
             WHERE ($1::text IS NULL OR description ILIKE $1 OR type ILIKE $1)
@@ -102,9 +111,9 @@ router.post('/expense', async (req, res) => {
     }
 });
 
-// 4. MANUAL ADJUSTMENT (Used for Manual Income/Entry)
+// 4. MANUAL ADJUSTMENT
 router.post('/adjust', async (req, res) => {
-    const { type, amount, mode, note } = req.body; // type: 'ADD' or 'REMOVE'
+    const { type, amount, mode, note } = req.body; 
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
@@ -114,10 +123,7 @@ router.post('/adjust', async (req, res) => {
         
         await client.query(`UPDATE shop_assets SET ${col} = ${col} ${operator} $1 WHERE id = 1`, [amount]);
         
-        // Log it so it appears in History
         if(note) {
-             // If ADD -> MANUAL_INCOME (Direction IN)
-             // If REMOVE -> MANUAL_EXPENSE (Direction OUT)
              const cat = type === 'ADD' ? 'MANUAL_INCOME' : 'MANUAL_EXPENSE';
              await client.query(
                 "INSERT INTO general_expenses (description, amount, category, payment_mode) VALUES ($1, $2, $3, $4)",

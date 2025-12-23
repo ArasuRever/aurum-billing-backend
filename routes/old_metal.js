@@ -1,11 +1,10 @@
 const express = require('express');
 const router = express.Router();
-const pool = require('../config/db'); // Ensure this path matches your db config
+const pool = require('../config/db'); 
 
 // 1. GET STATS
 router.get('/stats', async (req, res) => {
     try {
-        // Calculate total weight and cost for Gold and Silver
         const goldStats = await pool.query(`
             SELECT COALESCE(SUM(net_weight), 0) as weight, COALESCE(SUM(amount), 0) as cost 
             FROM old_metal_items WHERE metal_type = 'GOLD'
@@ -30,7 +29,6 @@ router.get('/stats', async (req, res) => {
 // 2. GET LIST (HISTORY)
 router.get('/list', async (req, res) => {
     try {
-        // Fetch Purchases joined with Items for a flattened view (or just purchases)
         const result = await pool.query(`
             SELECT p.id, p.voucher_no, p.customer_name, p.mobile, p.date, 
                    i.item_name, i.metal_type, i.net_weight, i.amount, p.net_payout
@@ -45,14 +43,14 @@ router.get('/list', async (req, res) => {
     }
 });
 
-// 3. ADD PURCHASE
+// 3. ADD PURCHASE (Updated with Asset Logic)
 router.post('/purchase', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
         const { customer_name, mobile, items, total_amount, gst_deducted, net_payout, payment_mode, cash_paid, online_paid } = req.body;
 
-        // Generate Voucher No (Simple Auto-increment logic or timestamp)
+        // Generate Voucher No
         const voucherRes = await client.query("SELECT COUNT(*) FROM old_metal_purchases");
         const count = parseInt(voucherRes.rows[0].count) + 1;
         const voucher_no = `OM-${new Date().getFullYear()}-${String(count).padStart(4, '0')}`;
@@ -77,6 +75,14 @@ router.post('/purchase', async (req, res) => {
             );
         }
 
+        // --- NEW: UPDATE SHOP ASSETS (Deduct Money) ---
+        if (cash_paid > 0) {
+            await client.query("UPDATE shop_assets SET cash_balance = cash_balance - $1 WHERE id = 1", [cash_paid]);
+        }
+        if (online_paid > 0) {
+            await client.query("UPDATE shop_assets SET bank_balance = bank_balance - $1 WHERE id = 1", [online_paid]);
+        }
+
         await client.query('COMMIT');
         res.json({ message: 'Purchase Saved', voucher_no });
     } catch (err) {
@@ -88,22 +94,35 @@ router.post('/purchase', async (req, res) => {
     }
 });
 
-// 4. DELETE PURCHASE (This fixes your 404 error)
+// 4. DELETE PURCHASE (Updated with Asset Reversal)
 router.delete('/:id', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
         const { id } = req.params;
 
-        // First delete items linked to this purchase (Foreign Key constraint)
-        await client.query('DELETE FROM old_metal_items WHERE purchase_id = $1', [id]);
-
-        // Then delete the purchase record itself
-        const result = await client.query('DELETE FROM old_metal_purchases WHERE id = $1', [id]);
-
-        if (result.rowCount === 0) {
+        // Fetch Purchase details first to know how much to refund
+        const purchaseRes = await client.query("SELECT cash_paid, online_paid FROM old_metal_purchases WHERE id = $1", [id]);
+        
+        if (purchaseRes.rows.length === 0) {
             await client.query('ROLLBACK');
             return res.status(404).json({ message: "Record not found" });
+        }
+
+        const { cash_paid, online_paid } = purchaseRes.rows[0];
+
+        // Delete items linked to this purchase
+        await client.query('DELETE FROM old_metal_items WHERE purchase_id = $1', [id]);
+
+        // Delete the purchase record
+        await client.query('DELETE FROM old_metal_purchases WHERE id = $1', [id]);
+
+        // --- NEW: REVERT SHOP ASSETS (Add Money Back) ---
+        if (cash_paid > 0) {
+            await client.query("UPDATE shop_assets SET cash_balance = cash_balance + $1 WHERE id = 1", [cash_paid]);
+        }
+        if (online_paid > 0) {
+            await client.query("UPDATE shop_assets SET bank_balance = bank_balance + $1 WHERE id = 1", [online_paid]);
         }
 
         await client.query('COMMIT');
