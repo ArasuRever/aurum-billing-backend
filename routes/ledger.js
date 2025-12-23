@@ -22,7 +22,7 @@ router.get('/stats', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. GET MASTER HISTORY (Updated with Old Metal)
+// 2. GET MASTER HISTORY (Updated Vendor Mode Logic)
 router.get('/history', async (req, res) => {
     const { search } = req.query;
     try {
@@ -38,10 +38,11 @@ router.get('/history', async (req, res) => {
                 
                 UNION ALL
                 
-                -- 2. VENDORS
+                -- 2. VENDORS (Fixed: Show STOCK instead of CASH for inventory adds)
                 SELECT id, 'VENDOR_TXN' as type, description, repaid_cash_amount as cash_amount, 
                        (stock_pure_weight + repaid_metal_weight) as gold_weight, 0 as silver_weight,
-                       'CASH' as payment_mode, created_at as date, 
+                       CASE WHEN repaid_cash_amount > 0 THEN 'CASH' ELSE 'STOCK' END as payment_mode, 
+                       created_at as date, 
                        CASE WHEN repaid_cash_amount > 0 THEN 'OUT' ELSE 'IN' END as direction
                 FROM vendor_transactions 
                 WHERE repaid_cash_amount > 0 OR stock_pure_weight > 0 OR repaid_metal_weight > 0
@@ -64,10 +65,10 @@ router.get('/history', async (req, res) => {
                        payment_mode, created_at as date, 
                        CASE WHEN category = 'MANUAL_INCOME' THEN 'IN' ELSE 'OUT' END as direction
                 FROM general_expenses
-
+                
                 UNION ALL
 
-                -- 5. OLD METAL PURCHASES (New Section)
+                -- 5. OLD METAL
                 SELECT id, 'OLD_METAL' as type, CONCAT('Bought from ', customer_name, ' (', voucher_no, ')') as description, 
                        net_payout as cash_amount, 
                        0 as gold_weight, 0 as silver_weight,

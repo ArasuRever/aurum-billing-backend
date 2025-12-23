@@ -35,7 +35,7 @@ router.get('/search-item', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. CREATE BILL (Updated for Ledger)
+// 3. CREATE BILL (Updated for Split Payments & Exchange Inventory)
 router.post('/create-bill', async (req, res) => {
   const { customer, items, exchangeItems, totals, includeGST } = req.body;
   const client = await pool.connect();
@@ -43,9 +43,11 @@ router.post('/create-bill', async (req, res) => {
     await client.query('BEGIN');
     const invoiceNumber = `INV-${Date.now()}`;
 
-    const netPayable = totals.netPayable || 0;
-    const paid = totals.paidAmount !== undefined ? totals.paidAmount : netPayable;
-    const balance = totals.balance !== undefined ? totals.balance : 0;
+    // Extract Payment Details
+    const cashReceived = parseFloat(totals.cashReceived) || 0;
+    const onlineReceived = parseFloat(totals.onlineReceived) || 0;
+    const totalPaid = parseFloat(totals.paidAmount) || 0; // Should be sum of above
+    const balance = parseFloat(totals.balance) || 0;
     const status = balance > 0 ? 'PARTIAL' : 'PAID';
 
     // A. Create Sale Record
@@ -59,19 +61,27 @@ router.post('/create-bill', async (req, res) => {
         invoiceNumber, customer.name, customer.phone, 
         totals.grossTotal || 0, totals.totalDiscount || 0, totals.taxableAmount || 0, 
         totals.sgst || 0, totals.cgst || 0, totals.roundOff || 0, 
-        totals.netPayable, totals.exchangeTotal || 0, includeGST, paid, balance, status
+        totals.netPayable, totals.exchangeTotal || 0, includeGST, totalPaid, balance, status
       ]
     );
     const saleId = saleRes.rows[0].id;
 
-    // --- NEW: RECORD PAYMENT FOR LEDGER ---
-    if (parseFloat(paid) > 0) {
+    // --- NEW: RECORD SPLIT PAYMENTS FOR LEDGER ---
+    // 1. CASH
+    if (cashReceived > 0) {
         await client.query(
-            `INSERT INTO sale_payments (sale_id, amount, payment_mode, note) VALUES ($1, $2, 'CASH', 'Initial Payment')`,
-            [saleId, paid]
+            `INSERT INTO sale_payments (sale_id, amount, payment_mode, note) VALUES ($1, $2, 'CASH', 'Bill Payment')`,
+            [saleId, cashReceived]
         );
-        // Also update Shop Assets (Ledger Balance)
-        await client.query(`UPDATE shop_assets SET cash_balance = cash_balance + $1 WHERE id = 1`, [paid]);
+        await client.query(`UPDATE shop_assets SET cash_balance = cash_balance + $1 WHERE id = 1`, [cashReceived]);
+    }
+    // 2. ONLINE
+    if (onlineReceived > 0) {
+        await client.query(
+            `INSERT INTO sale_payments (sale_id, amount, payment_mode, note) VALUES ($1, $2, 'ONLINE', 'Bill Payment')`,
+            [saleId, onlineReceived]
+        );
+        await client.query(`UPDATE shop_assets SET bank_balance = bank_balance + $1 WHERE id = 1`, [onlineReceived]);
     }
 
     // B. Process Sale Items
@@ -113,12 +123,26 @@ router.post('/create-bill', async (req, res) => {
       }
     }
 
-    // C. Exchange Items
+    // C. Exchange Items (Updated: Add to Inventory)
     if (exchangeItems && exchangeItems.length > 0) {
       for (const ex of exchangeItems) {
+        // 1. Record in Bill History
         await client.query(
           `INSERT INTO sale_exchange_items (sale_id, item_name, metal_type, gross_weight, less_percent, less_weight, net_weight, rate, total_amount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
           [saleId, ex.name, ex.metal_type, ex.gross_weight, ex.less_percent, ex.less_weight, ex.net_weight, ex.rate, ex.total]
+        );
+
+        // 2. --- NEW: AUTO ADD TO INVENTORY ---
+        // We set source_type to 'EXCHANGE' and ensure NO VENDOR ID is linked to avoid debt.
+        const barcode = `EX-${Date.now()}-${Math.floor(Math.random()*1000)}`;
+        const gross = parseFloat(ex.gross_weight) || 0;
+        const net = parseFloat(ex.net_weight) || 0;
+        
+        await client.query(
+           `INSERT INTO inventory_items 
+           (source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, pure_weight, status, stock_type)
+           VALUES ($1, $2, $3, $4, $5, 0, $6, 'AVAILABLE', 'OLD_METAL')`,
+           ['EXCHANGE', ex.metal_type, ex.name, barcode, gross, net]
         );
       }
     }
@@ -147,7 +171,7 @@ router.post('/add-payment', async (req, res) => {
             [sale_id, payAmount, payment_mode || 'CASH', note]
         );
 
-        // --- NEW: Update Shop Assets ---
+        // Update Shop Assets
         const col = (payment_mode === 'ONLINE' || payment_mode === 'BANK') ? 'bank_balance' : 'cash_balance';
         await client.query(`UPDATE shop_assets SET ${col} = ${col} + $1 WHERE id = 1`, [payAmount]);
 
