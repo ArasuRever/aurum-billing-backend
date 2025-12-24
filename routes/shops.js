@@ -185,16 +185,9 @@ router.delete('/transaction/:id', async (req, res) => {
     const txn = txnRes.rows[0];
 
     // --- A. REVERSE LEDGER IMPACT ---
-    // We assume if it was added, it impacted ledger. 
-    // Ideally we should store 'transfer_cash' status, but mostly only Manual Cash Entries impact ledger.
-    // If it was an ITEM entry (MC), we might revert incorrectly.
-    // Since we don't store 'transfer_cash' boolean in DB, we rely on checking description or context?
-    // BETTER FIX: For now, we revert cash if > 0. 
-    // FUTURE: Add 'affects_ledger' column to shop_transactions.
     const c_val = parseFloat(txn.cash_amount) || 0;
     
-    // Simple heuristic: If description contains "Item" or "Sold", it was likely MC (Non-Cash). 
-    // If "Cash Loan" or "Settlement", it was Cash.
+    // Heuristic: If description contains "Item" or "Sold", it was likely MC (Non-Cash).
     const desc = (txn.description || '').toLowerCase();
     const isLikelyMC = desc.includes('item') || desc.includes('sold') || desc.includes('mc');
     
