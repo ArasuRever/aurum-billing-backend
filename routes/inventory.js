@@ -6,7 +6,7 @@ const multer = require('multer');
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// 1. ADD ITEM (Single) - Kept for legacy compatibility
+// 1. ADD ITEM (Single - Legacy Support)
 router.post('/add', upload.single('item_image'), async (req, res) => {
   const { 
     vendor_id, neighbour_shop_id, source_type, 
@@ -41,13 +41,14 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
     );
     const newItem = itemRes.rows[0];
 
-    // Update Vendor Ledger (Pass metal_type explicitly)
+    // Update Vendor Ledger
     if (finalSource === 'VENDOR' && vendor_id) {
         await client.query(
             `UPDATE vendors SET balance_pure_weight = balance_pure_weight + $1 WHERE id = $2`,
             [pure_weight, vendor_id]
         );
         
+        // CRITICAL FIX: We now insert 'metal_type' so the ledger knows if it's Gold or Silver
         await client.query(
             `INSERT INTO vendor_transactions 
             (vendor_id, type, description, stock_pure_weight, balance_after, metal_type)
@@ -67,10 +68,10 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
   }
 });
 
-// --- NEW: BATCH STOCK ENTRY (Grid System) ---
+// --- NEW: BATCH STOCK ENTRY (Groups items in Ledger) ---
 router.post('/batch-add', async (req, res) => {
   const { vendor_id, metal_type, invoice_no, items } = req.body; 
-  // items: [{ item_name, gross_weight, wastage_percent, making_charges, huid }, ...]
+  // items: [{ item_name, gross_weight, wastage_percent, ... }, ...]
   
   const client = await pool.connect();
   try {
@@ -80,7 +81,6 @@ router.post('/batch-add', async (req, res) => {
     let totalGross = 0;
     let totalPure = 0;
     
-    // Pre-calculate totals
     items.forEach(i => {
         const g = parseFloat(i.gross_weight) || 0;
         const p = parseFloat(i.wastage_percent) || 0;
@@ -88,6 +88,7 @@ router.post('/batch-add', async (req, res) => {
         totalPure += (g * (p/100));
     });
 
+    // Insert into stock_batches
     const batchRes = await client.query(
         `INSERT INTO stock_batches (vendor_id, invoice_no, metal_type, total_gross_weight, total_pure_weight, item_count)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
@@ -116,6 +117,7 @@ router.post('/batch-add', async (req, res) => {
         [totalPure, vendor_id]
     );
 
+    // 4. Create Ledger Entry (LINKED TO BATCH)
     await client.query(
         `INSERT INTO vendor_transactions 
         (vendor_id, type, description, stock_pure_weight, balance_after, metal_type, reference_id, reference_type)

@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 
-// 1. GET DASHBOARD STATS (Assets Only)
+// 1. GET DASHBOARD STATS
 router.get('/stats', async (req, res) => {
     try {
         const assets = await pool.query("SELECT * FROM shop_assets WHERE id = 1");
@@ -21,15 +21,12 @@ router.get('/stats', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. GET MASTER HISTORY (SAFE MODE)
-// This version uses NULL placeholders for columns that might be missing in your DB
+// 2. GET MASTER HISTORY (Fixed: Separates Gold & Silver + Refinery Support)
 router.get('/history', async (req, res) => {
     const { date, search } = req.query; 
     
     try {
         const searchTerm = search ? `%${search}%` : null;
-        
-        // Date Filter Logic
         let dateFilter = '1=1';
         if (date) {
             dateFilter = `DATE(date) = '${date}'`;
@@ -53,13 +50,16 @@ router.get('/history', async (req, res) => {
                 
                 UNION ALL
                 
-                -- 2. VENDORS (SAFE MODE: Using NULL for reference columns to prevent crash)
+                -- 2. VENDORS (Fixed Metal Logic)
                 SELECT id, 
                        'VENDOR_TXN' as type, 
                        description, 
                        repaid_cash_amount as cash_amount, 
+                       -- IF METAL_TYPE IS GOLD, put in GOLD column
                        CASE WHEN metal_type = 'GOLD' THEN (stock_pure_weight + repaid_metal_weight) ELSE 0 END as gold_weight, 
+                       -- IF METAL_TYPE IS SILVER, put in SILVER column
                        CASE WHEN metal_type = 'SILVER' THEN (stock_pure_weight + repaid_metal_weight) ELSE 0 END as silver_weight,
+                       
                        CASE WHEN repaid_cash_amount > 0 THEN 'CASH' ELSE 'STOCK' END as payment_mode, 
                        created_at as date, 
                        CASE WHEN repaid_cash_amount > 0 THEN 'OUT' ELSE 'IN' END as direction,
@@ -140,14 +140,11 @@ router.get('/history', async (req, res) => {
         
         const result = await pool.query(query, [searchTerm]);
         
-        // Calculate Day Stats
         let dayStats = { income: 0, expense: 0, gold_in: 0, gold_out: 0, silver_in: 0, silver_out: 0 };
-        
         result.rows.forEach(row => {
             const amt = parseFloat(row.cash_amount || 0);
             const gw = parseFloat(row.gold_weight || 0);
             const sw = parseFloat(row.silver_weight || 0);
-
             if (amt > 0) {
                 if(row.direction === 'IN') dayStats.income += amt;
                 else dayStats.expense += amt;
@@ -163,27 +160,18 @@ router.get('/history', async (req, res) => {
 
         res.json({ transactions: result.rows, dayStats });
     } catch (err) { 
-        console.error("Ledger History Error:", err);
         res.status(500).json({ error: err.message }); 
     }
 });
 
-// 3. ADD EXPENSE
 router.post('/expense', async (req, res) => {
     const { description, amount, category, payment_mode } = req.body;
     const client = await pool.connect();
-    
     try {
         await client.query('BEGIN');
-        
-        await client.query(
-            "INSERT INTO general_expenses (description, amount, category, payment_mode) VALUES ($1, $2, $3, $4)",
-            [description, amount, category, payment_mode]
-        );
-
+        await client.query("INSERT INTO general_expenses (description, amount, category, payment_mode) VALUES ($1, $2, $3, $4)", [description, amount, category, payment_mode]);
         const col = payment_mode === 'ONLINE' ? 'bank_balance' : 'cash_balance';
         await client.query(`UPDATE shop_assets SET ${col} = ${col} - $1 WHERE id = 1`, [amount]);
-
         await client.query('COMMIT');
         res.json({ success: true });
     } catch (err) {
@@ -194,26 +182,18 @@ router.post('/expense', async (req, res) => {
     }
 });
 
-// 4. MANUAL ADJUSTMENT
 router.post('/adjust', async (req, res) => {
     const { type, amount, mode, note } = req.body; 
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        
         const col = mode === 'ONLINE' ? 'bank_balance' : 'cash_balance';
         const operator = type === 'ADD' ? '+' : '-';
-        
         await client.query(`UPDATE shop_assets SET ${col} = ${col} ${operator} $1 WHERE id = 1`, [amount]);
-        
         if(note) {
              const cat = type === 'ADD' ? 'MANUAL_INCOME' : 'MANUAL_EXPENSE';
-             await client.query(
-                "INSERT INTO general_expenses (description, amount, category, payment_mode) VALUES ($1, $2, $3, $4)",
-                [note, amount, cat, mode]
-            );
+             await client.query("INSERT INTO general_expenses (description, amount, category, payment_mode) VALUES ($1, $2, $3, $4)", [note, amount, cat, mode]);
         }
-
         await client.query('COMMIT');
         res.json({ success: true });
     } catch(err) {
