@@ -48,7 +48,6 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
             [pure_weight, vendor_id]
         );
         
-        // CRITICAL FIX: We now insert 'metal_type' so the ledger knows if it's Gold or Silver
         await client.query(
             `INSERT INTO vendor_transactions 
             (vendor_id, type, description, stock_pure_weight, balance_after, metal_type)
@@ -71,43 +70,49 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
 // --- NEW: BATCH STOCK ENTRY (Groups items in Ledger) ---
 router.post('/batch-add', async (req, res) => {
   const { vendor_id, metal_type, invoice_no, items } = req.body; 
-  // items: [{ item_name, gross_weight, wastage_percent, ... }, ...]
+  // items: [{ item_name, gross_weight, wastage_percent, pure_weight, item_image_base64... }, ...]
   
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // 1. Create Batch Wrapper
+    // 1. Prepare Data & Totals
     let totalGross = 0;
     let totalPure = 0;
     
-    items.forEach(i => {
+    // Process items to ensure numbers are valid
+    const processedItems = items.map(i => {
         const g = parseFloat(i.gross_weight) || 0;
         const p = parseFloat(i.wastage_percent) || 0;
+        // Trust frontend pure_weight if provided (handles Wastage vs Touch modes correctly)
+        const pure = i.pure_weight ? parseFloat(i.pure_weight) : (g * (p/100));
+        
         totalGross += g;
-        totalPure += (g * (p/100));
+        totalPure += pure;
+        
+        return { ...i, g, p, pure };
     });
 
     // Insert into stock_batches
     const batchRes = await client.query(
         `INSERT INTO stock_batches (vendor_id, invoice_no, metal_type, total_gross_weight, total_pure_weight, item_count)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-        [vendor_id, invoice_no, metal_type, totalGross, totalPure, items.length]
+        [vendor_id, invoice_no || 'MANUAL', metal_type, totalGross, totalPure, items.length]
     );
     const batchId = batchRes.rows[0].id;
 
-    // 2. Insert Items
-    for (const item of items) {
+    // 2. Insert Items (Now handles Images)
+    for (const item of processedItems) {
         const barcode = `${metal_type.charAt(0)}-${Date.now()}-${Math.floor(Math.random()*1000)}`;
-        const g = parseFloat(item.gross_weight) || 0;
-        const p = parseFloat(item.wastage_percent) || 0;
-        const pure = g * (p/100);
+        
+        // Handle Base64 Image
+        const imgBuffer = item.item_image_base64 ? Buffer.from(item.item_image_base64, 'base64') : null;
 
         await client.query(
             `INSERT INTO inventory_items 
-            (vendor_id, batch_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, status, stock_type, huid)
-            VALUES ($1, $2, 'VENDOR', $3, $4, $5, $6, $7, $8, $9, 'AVAILABLE', 'SINGLE', $10)`,
-            [vendor_id, batchId, metal_type, item.item_name, barcode, g, p, item.making_charges, pure, item.huid || null]
+            (vendor_id, batch_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, status, stock_type, huid, item_image)
+            VALUES ($1, $2, 'VENDOR', $3, $4, $5, $6, $7, $8, $9, 'AVAILABLE', 'SINGLE', $10, $11)`,
+            [vendor_id, batchId, metal_type, item.item_name, barcode, item.g, item.p, item.making_charges, item.pure, item.huid || null, imgBuffer]
         );
     }
 
@@ -118,11 +123,15 @@ router.post('/batch-add', async (req, res) => {
     );
 
     // 4. Create Ledger Entry (LINKED TO BATCH)
+    const ledgerDesc = items.length === 1 
+        ? `Added Stock: ${items[0].item_name} (Inv#${invoice_no || 'NA'})`
+        : `Inv #${invoice_no || 'NA'}: Added ${items.length} Items`;
+
     await client.query(
         `INSERT INTO vendor_transactions 
         (vendor_id, type, description, stock_pure_weight, balance_after, metal_type, reference_id, reference_type)
          VALUES ($1, 'STOCK_ADDED', $2, $3, (SELECT balance_pure_weight FROM vendors WHERE id=$1), $4, $5, 'BATCH')`,
-        [vendor_id, `Inv #${invoice_no}: Added ${items.length} Items`, totalPure, metal_type, batchId]
+        [vendor_id, ledgerDesc, totalPure, metal_type, batchId]
     );
 
     await client.query('COMMIT');

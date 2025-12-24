@@ -2,23 +2,35 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db'); 
 
-// 1. GET STATS
+// 1. GET STATS (Aggregated: Direct Purchase + Bill Exchange)
 router.get('/stats', async (req, res) => {
     try {
-        const goldStats = await pool.query(`
+        // A. Direct Purchases
+        const goldPurchase = await pool.query(`
             SELECT COALESCE(SUM(net_weight), 0) as weight, COALESCE(SUM(amount), 0) as cost 
             FROM old_metal_items WHERE metal_type = 'GOLD'
         `);
-        const silverStats = await pool.query(`
+        const silverPurchase = await pool.query(`
             SELECT COALESCE(SUM(net_weight), 0) as weight, COALESCE(SUM(amount), 0) as cost 
             FROM old_metal_items WHERE metal_type = 'SILVER'
         `);
 
+        // B. Bill Exchanges
+        const goldExchange = await pool.query(`
+            SELECT COALESCE(SUM(net_weight), 0) as weight, COALESCE(SUM(total_amount), 0) as cost 
+            FROM sale_exchange_items WHERE metal_type = 'GOLD'
+        `);
+        const silverExchange = await pool.query(`
+            SELECT COALESCE(SUM(net_weight), 0) as weight, COALESCE(SUM(total_amount), 0) as cost 
+            FROM sale_exchange_items WHERE metal_type = 'SILVER'
+        `);
+
+        // C. Combine
         res.json({
-            gold_weight: goldStats.rows[0].weight,
-            gold_cost: goldStats.rows[0].cost,
-            silver_weight: silverStats.rows[0].weight,
-            silver_cost: silverStats.rows[0].cost
+            gold_weight: parseFloat(goldPurchase.rows[0].weight) + parseFloat(goldExchange.rows[0].weight),
+            gold_cost: parseFloat(goldPurchase.rows[0].cost) + parseFloat(goldExchange.rows[0].cost),
+            silver_weight: parseFloat(silverPurchase.rows[0].weight) + parseFloat(silverExchange.rows[0].weight),
+            silver_cost: parseFloat(silverPurchase.rows[0].cost) + parseFloat(silverExchange.rows[0].cost)
         });
     } catch (err) {
         console.error(err);
