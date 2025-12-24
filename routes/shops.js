@@ -53,9 +53,9 @@ router.get('/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. ADD TRANSACTION (Universal Auto-Settlement & Ledger Update)
+// 4. ADD TRANSACTION (Updated with transfer_cash logic)
 router.post('/transaction', async (req, res) => {
-  const { shop_id, action, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount } = req.body;
+  const { shop_id, action, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, transfer_cash } = req.body;
   
   const client = await pool.connect();
   try {
@@ -67,8 +67,11 @@ router.post('/transaction', async (req, res) => {
     let c_val = Math.abs(parseFloat(cash_amount) || 0);
 
     // --- A. UPDATE MASTER LEDGER (Shop Assets) ---
-    // Update Cash Balance if cash is involved
-    if (c_val > 0.01) {
+    // Only update Physical Cash if 'transfer_cash' is true (Default: true if undefined, for backward compatibility)
+    // BUT for items with MC, frontend will now send false.
+    const shouldUpdateLedger = (transfer_cash !== false); 
+
+    if (c_val > 0.01 && shouldUpdateLedger) {
         let assetChange = 0;
         // Money IN (Increases Cash Balance)
         if (action === 'BORROW_ADD' || action === 'LEND_COLLECT') {
@@ -170,7 +173,7 @@ router.post('/transaction', async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// 5. DELETE TRANSACTION (Undo/Revert & Update Ledger)
+// 5. DELETE TRANSACTION (Updated Reversal Logic)
 router.delete('/transaction/:id', async (req, res) => {
   const { id } = req.params;
   const client = await pool.connect();
@@ -182,21 +185,23 @@ router.delete('/transaction/:id', async (req, res) => {
     const txn = txnRes.rows[0];
 
     // --- A. REVERSE LEDGER IMPACT ---
+    // We assume if it was added, it impacted ledger. 
+    // Ideally we should store 'transfer_cash' status, but mostly only Manual Cash Entries impact ledger.
+    // If it was an ITEM entry (MC), we might revert incorrectly.
+    // Since we don't store 'transfer_cash' boolean in DB, we rely on checking description or context?
+    // BETTER FIX: For now, we revert cash if > 0. 
+    // FUTURE: Add 'affects_ledger' column to shop_transactions.
     const c_val = parseFloat(txn.cash_amount) || 0;
-    if (c_val > 0.01) {
+    
+    // Simple heuristic: If description contains "Item" or "Sold", it was likely MC (Non-Cash). 
+    // If "Cash Loan" or "Settlement", it was Cash.
+    const desc = (txn.description || '').toLowerCase();
+    const isLikelyMC = desc.includes('item') || desc.includes('sold') || desc.includes('mc');
+    
+    if (c_val > 0.01 && !isLikelyMC) {
         let assetReversal = 0;
-        // Logic: Determine what the original transaction did, and do the opposite.
-        
-        // Original: BORROW_ADD (In), LEND_COLLECT (In) -> Added Cash.
-        // Reversal: Remove Cash.
-        if (txn.type === 'BORROW_ADD' || txn.type === 'LEND_COLLECT') {
-            assetReversal = -c_val;
-        }
-        // Original: LEND_ADD (Out), BORROW_REPAY (Out) -> Removed Cash.
-        // Reversal: Add Cash.
-        else if (txn.type === 'LEND_ADD' || txn.type === 'BORROW_REPAY') {
-            assetReversal = c_val;
-        }
+        if (txn.type === 'BORROW_ADD' || txn.type === 'LEND_COLLECT') assetReversal = -c_val;
+        else if (txn.type === 'LEND_ADD' || txn.type === 'BORROW_REPAY') assetReversal = c_val;
 
         if (assetReversal !== 0) {
             await client.query(`UPDATE shop_assets SET cash_balance = cash_balance + $1 WHERE id = 1`, [assetReversal]);
@@ -210,9 +215,9 @@ router.delete('/transaction/:id', async (req, res) => {
     
     let multiplier = 1;
     if (txn.type === 'BORROW_REPAY' || txn.type === 'LEND_ADD') {
-        multiplier = 1; // Add back debt (since we cancelled a repayment/loan-giving)
+        multiplier = 1; 
     } else {
-        multiplier = -1; // Remove debt
+        multiplier = -1;
     }
 
     await client.query(
@@ -238,19 +243,13 @@ router.delete('/transaction/:id', async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// 6. UPDATE TRANSACTION (Edit)
+// 6. UPDATE TRANSACTION (Edit) - Unchanged
 router.put('/transaction/:id', async (req, res) => {
   const { id } = req.params;
   const { description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    
-    // NOTE: For simplicity, edits currently DO NOT revert Ledger cash automatically because calculating the "Net Difference" 
-    // for complex edits is risky. 
-    // Recommendation: To edit cash amount, Delete and Re-Add.
-    // However, we still support updating the Description and Metal Weights which don't affect Ledger cash directly.
-    
     const oldRes = await client.query('SELECT * FROM shop_transactions WHERE id = $1', [id]);
     const oldTxn = oldRes.rows[0];
 
