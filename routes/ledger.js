@@ -21,12 +21,14 @@ router.get('/stats', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. GET MASTER HISTORY (Fixed: Separates Gold & Silver + Refinery Support)
+// 2. GET MASTER HISTORY
 router.get('/history', async (req, res) => {
     const { date, search } = req.query; 
     
     try {
         const searchTerm = search ? `%${search}%` : null;
+        
+        // Date Filter
         let dateFilter = '1=1';
         if (date) {
             dateFilter = `DATE(date) = '${date}'`;
@@ -50,21 +52,20 @@ router.get('/history', async (req, res) => {
                 
                 UNION ALL
                 
-                -- 2. VENDORS (Fixed Metal Logic)
+                -- 2. VENDORS
                 SELECT id, 
                        'VENDOR_TXN' as type, 
                        description, 
                        repaid_cash_amount as cash_amount, 
-                       -- IF METAL_TYPE IS GOLD, put in GOLD column
+                       -- Strict Metal Separation
                        CASE WHEN metal_type = 'GOLD' THEN (stock_pure_weight + repaid_metal_weight) ELSE 0 END as gold_weight, 
-                       -- IF METAL_TYPE IS SILVER, put in SILVER column
                        CASE WHEN metal_type = 'SILVER' THEN (stock_pure_weight + repaid_metal_weight) ELSE 0 END as silver_weight,
                        
                        CASE WHEN repaid_cash_amount > 0 THEN 'CASH' ELSE 'STOCK' END as payment_mode, 
                        created_at as date, 
                        CASE WHEN repaid_cash_amount > 0 THEN 'OUT' ELSE 'IN' END as direction,
-                       NULL::integer as reference_id, 
-                       NULL::text as reference_type
+                       reference_id, 
+                       reference_type
                 FROM vendor_transactions 
                 WHERE repaid_cash_amount > 0 OR stock_pure_weight > 0 OR repaid_metal_weight > 0
                 
@@ -141,10 +142,12 @@ router.get('/history', async (req, res) => {
         const result = await pool.query(query, [searchTerm]);
         
         let dayStats = { income: 0, expense: 0, gold_in: 0, gold_out: 0, silver_in: 0, silver_out: 0 };
+        
         result.rows.forEach(row => {
             const amt = parseFloat(row.cash_amount || 0);
             const gw = parseFloat(row.gold_weight || 0);
             const sw = parseFloat(row.silver_weight || 0);
+
             if (amt > 0) {
                 if(row.direction === 'IN') dayStats.income += amt;
                 else dayStats.expense += amt;
@@ -160,10 +163,12 @@ router.get('/history', async (req, res) => {
 
         res.json({ transactions: result.rows, dayStats });
     } catch (err) { 
+        console.error("Ledger History Error:", err);
         res.status(500).json({ error: err.message }); 
     }
 });
 
+// ... Keep existing POST routes (expense, adjust) ...
 router.post('/expense', async (req, res) => {
     const { description, amount, category, payment_mode } = req.body;
     const client = await pool.connect();
