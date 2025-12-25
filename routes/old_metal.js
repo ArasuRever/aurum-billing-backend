@@ -55,7 +55,7 @@ router.get('/list', async (req, res) => {
     }
 });
 
-// 3. ADD PURCHASE (Updated with Asset Logic)
+// 3. ADD PURCHASE (Updated with Asset Logic & Status)
 router.post('/purchase', async (req, res) => {
     const client = await pool.connect();
     try {
@@ -77,12 +77,12 @@ router.post('/purchase', async (req, res) => {
         );
         const purchaseId = purchaseRes.rows[0].id;
 
-        // Insert Items
+        // Insert Items (WITH STATUS 'AVAILABLE')
         for (const item of items) {
             await client.query(`
                 INSERT INTO old_metal_items 
-                (purchase_id, item_name, metal_type, gross_weight, less_percent, less_weight, net_weight, rate, amount)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                (purchase_id, item_name, metal_type, gross_weight, less_percent, less_weight, net_weight, rate, amount, status)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'AVAILABLE')`,
                 [purchaseId, item.item_name, item.metal_type, item.gross_weight, item.less_percent, item.less_weight, item.net_weight, item.rate, item.amount]
             );
         }
