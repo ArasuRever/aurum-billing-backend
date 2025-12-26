@@ -6,7 +6,7 @@ const multer = require('multer');
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// ... [Keep existing /rates routes] ...
+// --- 1. DAILY RATES ---
 router.get('/rates', async (req, res) => {
     try {
         const result = await pool.query("SELECT * FROM daily_rates");
@@ -28,7 +28,7 @@ router.post('/rates', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- PRODUCT TYPES (Updated with HSN) ---
+// --- 2. PRODUCT TYPES (Added HSN) ---
 router.get('/types', async (req, res) => {
     try {
         const result = await pool.query("SELECT * FROM product_types ORDER BY id ASC");
@@ -67,7 +67,7 @@ router.delete('/types/:id', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- MASTER ITEMS (Updated with HSN) ---
+// --- 3. MASTER ITEMS (Added HSN) ---
 router.get('/items', async (req, res) => {
     try {
         const result = await pool.query("SELECT * FROM item_masters ORDER BY id DESC");
@@ -77,20 +77,16 @@ router.get('/items', async (req, res) => {
 
 router.post('/items/bulk', async (req, res) => {
     const { item_names, metal_type, default_wastage, mc_type, mc_value, calc_method, hsn_code } = req.body;
-    
     if (!item_names || !Array.isArray(item_names) || item_names.length === 0) {
         return res.status(400).json({ error: "No item names provided" });
     }
-
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
         const insertedItems = [];
-
         for (const name of item_names) {
             const cleanName = name.trim();
             if(!cleanName) continue;
-
             const res = await client.query(
                 `INSERT INTO item_masters (item_name, metal_type, default_wastage, mc_type, mc_value, calc_method, hsn_code) 
                  VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
@@ -98,10 +94,8 @@ router.post('/items/bulk', async (req, res) => {
             );
             insertedItems.push(res.rows[0]);
         }
-        
         await client.query('COMMIT');
         res.json({ success: true, count: insertedItems.length, items: insertedItems });
-
     } catch (err) {
         await client.query('ROLLBACK');
         res.status(500).json({ error: "Failed to add items." });
@@ -129,7 +123,7 @@ router.delete('/items/:id', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- BUSINESS PROFILE ---
+// --- 4. BUSINESS PROFILE SETTINGS ---
 router.get('/business', async (req, res) => {
     try {
         const result = await pool.query("SELECT * FROM business_settings ORDER BY id DESC LIMIT 1");
