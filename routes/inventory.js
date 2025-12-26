@@ -21,7 +21,9 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
 
     const finalSource = source_type || 'VENDOR'; 
     const prefix = metal_type === 'GOLD' ? 'G' : 'S';
-    const barcode = `${prefix}-${Date.now()}`;
+    // FIXED: Short unique barcode (approx 8-9 chars) instead of long timestamp
+    const barcode = `${prefix}-${Date.now().toString(36).toUpperCase()}`;
+    
     const gross = parseFloat(gross_weight) || 0;
     const purityVal = parseFloat(wastage_percent) || 0; 
     
@@ -92,7 +94,6 @@ router.post('/batch-add', async (req, res) => {
     });
 
     // 2. Insert into stock_batches
-    // If vendor_id is null, it inserts NULL, which effectively groups these as "No Vendor / Own Stock"
     const batchRes = await client.query(
         `INSERT INTO stock_batches (vendor_id, invoice_no, metal_type, total_gross_weight, total_pure_weight, item_count)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
@@ -101,11 +102,11 @@ router.post('/batch-add', async (req, res) => {
     const batchId = batchRes.rows[0].id;
 
     // 3. Insert Items (Handles Images & Source Type)
-    // If vendor_id is provided, source='VENDOR'. If null, source='OWN'.
     const sourceType = vendor_id ? 'VENDOR' : 'OWN';
 
     for (const item of processedItems) {
-        const barcode = `${metal_type.charAt(0)}-${Date.now()}-${Math.floor(Math.random()*1000)}`;
+        // FIXED: Shorter Barcode for Batch items
+        const barcode = `${metal_type.charAt(0)}-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random()*100)}`;
         const imgBuffer = item.item_image_base64 ? Buffer.from(item.item_image_base64, 'base64') : null;
 
         await client.query(
