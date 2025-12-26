@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 
-// 1. GET ALL BILLS (History)
+// 1. GET ALL BILLS
 router.get('/history', async (req, res) => {
     try {
         const result = await pool.query("SELECT * FROM gst_bills ORDER BY id DESC");
@@ -10,7 +10,7 @@ router.get('/history', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. GET SINGLE BILL (With Items & Exchange)
+// 2. GET SINGLE BILL
 router.get('/:id', async (req, res) => {
     try {
         const billRes = await pool.query("SELECT * FROM gst_bills WHERE id = $1", [req.params.id]);
@@ -45,14 +45,26 @@ router.post('/create', async (req, res) => {
         );
         const billId = billRes.rows[0].id;
 
-        // Insert Sale Items
+        // Insert Sale Items (UPDATED)
         if (items && items.length > 0) {
             for (const item of items) {
                 await client.query(
                     `INSERT INTO gst_bill_items 
                     (bill_id, item_name, hsn_code, gross_weight, wastage_percent, wastage_weight, purity, rate, making_charges, discount_amount, taxable_value)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-                    [billId, item.item_name, item.hsn_code, item.gross_weight, item.wastage_percent, item.wastage_weight, item.purity, item.rate, item.making_charges, item.discount, item.total]
+                    [
+                        billId, 
+                        item.item_name, 
+                        item.hsn_code || '', 
+                        item.gross_weight || 0, 
+                        item.wastage_percent || 0, 
+                        item.wastage_weight || 0, 
+                        item.purity || '', 
+                        item.rate || 0, 
+                        item.making_charges || 0, 
+                        item.discount || 0, 
+                        item.total || 0
+                    ]
                 );
             }
         }
@@ -105,7 +117,11 @@ router.put('/update/:id', async (req, res) => {
                     `INSERT INTO gst_bill_items 
                     (bill_id, item_name, hsn_code, gross_weight, wastage_percent, wastage_weight, purity, rate, making_charges, discount_amount, taxable_value)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-                    [id, item.item_name, item.hsn_code, item.gross_weight, item.wastage_percent, item.wastage_weight, item.purity, item.rate, item.making_charges, item.discount, item.total]
+                    [
+                        id, item.item_name, item.hsn_code || '', 
+                        item.gross_weight || 0, item.wastage_percent || 0, item.wastage_weight || 0, 
+                        item.purity || '', item.rate || 0, item.making_charges || 0, item.discount || 0, item.total || 0
+                    ]
                 );
             }
         }
