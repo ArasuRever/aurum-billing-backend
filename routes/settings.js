@@ -3,11 +3,10 @@ const router = express.Router();
 const pool = require('../config/db');
 const multer = require('multer');
 
-// Configure Multer for Logo Upload
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// --- 1. DAILY RATES ---
+// ... [Keep existing /rates routes] ...
 router.get('/rates', async (req, res) => {
     try {
         const result = await pool.query("SELECT * FROM daily_rates");
@@ -29,7 +28,7 @@ router.post('/rates', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- 2. PRODUCT TYPES (DYNAMIC TABS) ---
+// --- PRODUCT TYPES (Updated with HSN) ---
 router.get('/types', async (req, res) => {
     try {
         const result = await pool.query("SELECT * FROM product_types ORDER BY id ASC");
@@ -38,21 +37,21 @@ router.get('/types', async (req, res) => {
 });
 
 router.post('/types', async (req, res) => {
-    const { name, formula, display_color } = req.body;
+    const { name, formula, display_color, hsn_code } = req.body;
     try {
         await pool.query(
-            `INSERT INTO product_types (name, formula, display_color) VALUES ($1, $2, $3)`,
-            [name.toUpperCase(), formula, display_color]
+            `INSERT INTO product_types (name, formula, display_color, hsn_code) VALUES ($1, $2, $3, $4)`,
+            [name.toUpperCase(), formula, display_color, hsn_code]
         );
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 router.put('/types/:id', async (req, res) => {
-    const { formula, display_color } = req.body;
+    const { formula, display_color, hsn_code } = req.body;
     try {
-        await pool.query(`UPDATE product_types SET formula=$1, display_color=$2 WHERE id=$3`, 
-            [formula, display_color, req.params.id]);
+        await pool.query(`UPDATE product_types SET formula=$1, display_color=$2, hsn_code=$3 WHERE id=$4`, 
+            [formula, display_color, hsn_code, req.params.id]);
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -68,7 +67,7 @@ router.delete('/types/:id', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- 3. MASTER ITEMS ---
+// --- MASTER ITEMS (Updated with HSN) ---
 router.get('/items', async (req, res) => {
     try {
         const result = await pool.query("SELECT * FROM item_masters ORDER BY id DESC");
@@ -77,26 +76,32 @@ router.get('/items', async (req, res) => {
 });
 
 router.post('/items/bulk', async (req, res) => {
-    const { item_names, metal_type, default_wastage, mc_type, mc_value, calc_method } = req.body;
+    const { item_names, metal_type, default_wastage, mc_type, mc_value, calc_method, hsn_code } = req.body;
+    
     if (!item_names || !Array.isArray(item_names) || item_names.length === 0) {
         return res.status(400).json({ error: "No item names provided" });
     }
+
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
         const insertedItems = [];
+
         for (const name of item_names) {
             const cleanName = name.trim();
             if(!cleanName) continue;
+
             const res = await client.query(
-                `INSERT INTO item_masters (item_name, metal_type, default_wastage, mc_type, mc_value, calc_method) 
-                 VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-                [cleanName, metal_type, default_wastage || 0, mc_type || 'FIXED', mc_value || 0, calc_method || 'STANDARD']
+                `INSERT INTO item_masters (item_name, metal_type, default_wastage, mc_type, mc_value, calc_method, hsn_code) 
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+                [cleanName, metal_type, default_wastage || 0, mc_type || 'FIXED', mc_value || 0, calc_method || 'STANDARD', hsn_code || '']
             );
             insertedItems.push(res.rows[0]);
         }
+        
         await client.query('COMMIT');
         res.json({ success: true, count: insertedItems.length, items: insertedItems });
+
     } catch (err) {
         await client.query('ROLLBACK');
         res.status(500).json({ error: "Failed to add items." });
@@ -107,11 +112,11 @@ router.post('/items/bulk', async (req, res) => {
 
 router.put('/items/:id', async (req, res) => {
     const { id } = req.params;
-    const { item_name, metal_type, default_wastage, mc_type, mc_value, calc_method } = req.body;
+    const { item_name, metal_type, default_wastage, mc_type, mc_value, calc_method, hsn_code } = req.body;
     try {
         const result = await pool.query(
-            `UPDATE item_masters SET item_name = $1, metal_type = $2, default_wastage = $3, mc_type = $4, mc_value = $5, calc_method = $6 WHERE id = $7 RETURNING *`,
-            [item_name, metal_type, default_wastage, mc_type, mc_value, calc_method, id]
+            `UPDATE item_masters SET item_name = $1, metal_type = $2, default_wastage = $3, mc_type = $4, mc_value = $5, calc_method = $6, hsn_code = $7 WHERE id = $8 RETURNING *`,
+            [item_name, metal_type, default_wastage, mc_type, mc_value, calc_method, hsn_code, id]
         );
         res.json(result.rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -124,7 +129,7 @@ router.delete('/items/:id', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- 4. NEW: BUSINESS PROFILE SETTINGS ---
+// --- BUSINESS PROFILE ---
 router.get('/business', async (req, res) => {
     try {
         const result = await pool.query("SELECT * FROM business_settings ORDER BY id DESC LIMIT 1");
