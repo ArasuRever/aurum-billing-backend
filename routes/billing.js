@@ -175,7 +175,7 @@ router.get('/history', async (req, res) => {
     try { const result = await pool.query(`SELECT * FROM sales ORDER BY id DESC`); res.json(result.rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 7. DELETE BILL (UPDATED: Retains Neighbor Debt)
+// 7. DELETE BILL
 router.delete('/delete/:id', async (req, res) => {
     const { id } = req.params;
     const client = await pool.connect();
@@ -187,12 +187,11 @@ router.delete('/delete/:id', async (req, res) => {
       
       for (const row of itemsRes.rows) {
           // RESTORE TO INVENTORY
-          // CRITICAL FIX: Set source_type = 'OWN' and neighbour_shop_id = NULL
-          // This ensures we now own the item (since we kept the debt) and it won't add debt again if re-sold.
+          // Simply make it available again. We do NOT revert ownership because voiding a bill is ambiguous 
+          // regarding the debt created. For now, we assume the debt remains until manually adjusted, 
+          // or you might want to enhance this to reverse the debt transaction if possible.
           await client.query(
-              `UPDATE inventory_items 
-               SET status = 'AVAILABLE', source_type = 'OWN', neighbour_shop_id = NULL 
-               WHERE id = $1`, 
+              `UPDATE inventory_items SET status = 'AVAILABLE' WHERE id = $1`, 
               [row.item_id]
           );
       }
@@ -203,11 +202,11 @@ router.delete('/delete/:id', async (req, res) => {
       await client.query("DELETE FROM sales WHERE id = $1", [id]);
       
       await client.query('COMMIT');
-      res.json({ success: true, message: "Bill Voided. Items restored as Own Stock." });
+      res.json({ success: true, message: "Bill Voided. Items restored." });
     } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// 8. PROCESS RETURN / EXCHANGE (UPDATED: Retains Neighbor Debt)
+// 8. PROCESS RETURN / EXCHANGE
 router.post('/process-return', async (req, res) => {
     const { sale_id, customer_id, returned_items, exchange_items } = req.body;
     const client = await pool.connect();
@@ -220,11 +219,14 @@ router.post('/process-return', async (req, res) => {
         for (const item of returned_items) {
             totalRefund += parseFloat(item.refund_amount);
 
-            // RESTORE TO INVENTORY
-            // CRITICAL FIX: Set source_type = 'OWN' and neighbour_shop_id = NULL
+            // LOGIC CHANGE:
+            // If item was NEIGHBOUR -> Become OWN (Inshop) because debt is already active.
+            // If item was VENDOR -> Stay VENDOR (Goes back to vendor stock).
             await client.query(
                 `UPDATE inventory_items 
-                 SET status = 'AVAILABLE', source_type = 'OWN', neighbour_shop_id = NULL 
+                 SET status = 'AVAILABLE',
+                     source_type = CASE WHEN source_type = 'NEIGHBOUR' THEN 'OWN' ELSE source_type END,
+                     neighbour_shop_id = CASE WHEN source_type = 'NEIGHBOUR' THEN NULL ELSE neighbour_shop_id END
                  WHERE id = $1`, 
                 [item.original_inventory_id]
             );

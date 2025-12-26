@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const gstBillingRoutes = require('./routes/gst_billing');
 
 dotenv.config();
 
@@ -21,6 +22,7 @@ app.use('/api/shops', require('./routes/shops'));
 app.use('/api/settings', require('./routes/settings'));
 app.use('/api/ledger', require('./routes/ledger'));
 app.use('/api/old-metal', require('./routes/old_metal'));
+app.use('/api/gst', gstBillingRoutes);
 
 // --- NEW ROUTE ---
 app.use('/api/refinery', require('./routes/refinery'));
