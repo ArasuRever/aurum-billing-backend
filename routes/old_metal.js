@@ -82,7 +82,7 @@ router.post('/purchase', async (req, res) => {
             await client.query(`
                 INSERT INTO old_metal_items 
                 (purchase_id, item_name, metal_type, gross_weight, less_percent, less_weight, net_weight, rate, amount, status)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'AVAILABLE')`,
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'AVAILABLE')`,  // <--- CHANGED
                 [purchaseId, item.item_name, item.metal_type, item.gross_weight, item.less_percent, item.less_weight, item.net_weight, item.rate, item.amount]
             );
         }
