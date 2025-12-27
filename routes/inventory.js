@@ -20,7 +20,7 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
     await client.query('BEGIN');
 
     const finalSource = source_type || 'VENDOR'; 
-    const prefix = metal_type === 'GOLD' ? 'G' : 'S';
+    const prefix = metal_type ? metal_type.charAt(0).toUpperCase() : 'X';
     const barcode = `${prefix}-${Date.now().toString(36).toUpperCase()}`;
     
     const gross = parseFloat(gross_weight) || 0;
@@ -64,22 +64,21 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
 
   } catch (err) {
     await client.query('ROLLBACK');
+    console.error("Error in /add:", err.message);
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
   }
 });
 
-// --- NEW: BATCH STOCK ENTRY (Groups items in Ledger) ---
+// 2. BATCH ADD STOCK
 router.post('/batch-add', async (req, res) => {
   const { vendor_id, metal_type, invoice_no, items } = req.body; 
-  // items: [{ item_name, gross_weight, wastage_percent, pure_weight, item_image_base64, quantity... }, ...]
   
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // 1. Prepare Data & Totals
     let totalGross = 0;
     let totalPure = 0;
     
@@ -87,7 +86,7 @@ router.post('/batch-add', async (req, res) => {
         const g = parseFloat(i.gross_weight) || 0;
         const p = parseFloat(i.wastage_percent) || 0;
         const pure = i.pure_weight ? parseFloat(i.pure_weight) : (g * (p/100));
-        const qty = parseInt(i.quantity) || 1; // <--- Capture Quantity
+        const qty = parseInt(i.quantity) || 1; 
         
         totalGross += g;
         totalPure += pure;
@@ -95,7 +94,6 @@ router.post('/batch-add', async (req, res) => {
         return { ...i, g, p, pure, qty };
     });
 
-    // 2. Insert into stock_batches
     const batchRes = await client.query(
         `INSERT INTO stock_batches (vendor_id, invoice_no, metal_type, total_gross_weight, total_pure_weight, item_count)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
@@ -103,11 +101,11 @@ router.post('/batch-add', async (req, res) => {
     );
     const batchId = batchRes.rows[0].id;
 
-    // 3. Insert Items (Handles Images & Source Type)
     const sourceType = vendor_id ? 'VENDOR' : 'OWN';
 
     for (const item of processedItems) {
-        const barcode = `${metal_type.charAt(0)}-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random()*100)}`;
+        const prefix = metal_type ? metal_type.charAt(0).toUpperCase() : 'X';
+        const barcode = `${prefix}-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random()*100)}`;
         const imgBuffer = item.item_image_base64 ? Buffer.from(item.item_image_base64, 'base64') : null;
 
         await client.query(
@@ -118,7 +116,6 @@ router.post('/batch-add', async (req, res) => {
         );
     }
 
-    // 4. Update Vendor Balance & Ledger (ONLY IF VENDOR IS SELECTED)
     if (vendor_id) {
         await client.query(
             `UPDATE vendors SET balance_pure_weight = balance_pure_weight + $1 WHERE id = $2`,
@@ -142,24 +139,22 @@ router.post('/batch-add', async (req, res) => {
 
   } catch (err) {
     await client.query('ROLLBACK');
+    console.error("Error in /batch-add:", err.message);
     res.status(500).json({ error: err.message });
   } finally {
     client.release();
   }
 });
 
-// 2. LIST ALL ITEMS
+// 3. LIST ALL ITEMS
 router.get('/list', async (req, res) => {
   try {
     const result = await pool.query(`
-        SELECT i.*, 
-               v.business_name as vendor_name, 
-               n.shop_name as neighbour_name
+        SELECT i.*, v.business_name as vendor_name, n.shop_name as neighbour_name
         FROM inventory_items i
         LEFT JOIN vendors v ON i.vendor_id = v.id
         LEFT JOIN external_shops n ON i.neighbour_shop_id = n.id
-        WHERE i.status = 'AVAILABLE' 
-        ORDER BY i.created_at DESC`
+        WHERE i.status = 'AVAILABLE' ORDER BY i.created_at DESC`
     );
     const items = result.rows.map(item => ({
       ...item,
@@ -169,7 +164,7 @@ router.get('/list', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. VENDOR SPECIFIC INVENTORY
+// 4. VENDOR SPECIFIC INVENTORY (Current Stock)
 router.get('/vendor/:id', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM inventory_items WHERE vendor_id = $1 ORDER BY created_at DESC', [req.params.id]);
@@ -178,7 +173,7 @@ router.get('/vendor/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. UPDATE ITEM
+// 5. UPDATE ITEM
 router.put('/update/:id', async (req, res) => {
   const { id } = req.params;
   const { gross_weight, wastage_percent, update_comment } = req.body;
@@ -190,8 +185,7 @@ router.put('/update/:id', async (req, res) => {
     const newGross = parseFloat(gross_weight);
     const newPurity = parseFloat(wastage_percent);
     const newPure = newGross * (newPurity / 100); 
-    const oldPure = parseFloat(oldItem.pure_weight);
-    const diffPure = newPure - oldPure;
+    const diffPure = newPure - parseFloat(oldItem.pure_weight);
 
     await client.query(`INSERT INTO item_updates (item_id, old_values, update_comment) VALUES ($1, $2, $3)`, [id, JSON.stringify(oldItem), update_comment]);
     await client.query(`UPDATE inventory_items SET gross_weight=$1, wastage_percent=$2, pure_weight=$3 WHERE id=$4`, [newGross, newPurity, newPure, id]);
@@ -209,7 +203,7 @@ router.put('/update/:id', async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// 5. DELETE ITEM
+// 6. DELETE ITEM
 router.delete('/:id', async (req, res) => {
   const { id } = req.params;
   const client = await pool.connect();
@@ -233,6 +227,43 @@ router.delete('/:id', async (req, res) => {
     await client.query('COMMIT');
     res.json({ success: true });
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
+});
+
+// --- 7. NEW: VENDOR SALES HISTORY (For Sold Items List) ---
+router.get('/vendor-history/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const query = `
+            SELECT 
+                si.id,
+                si.sale_id,
+                si.item_name,
+                si.sold_weight as gross_weight,
+                si.sold_rate,
+                si.total_item_price,
+                s.created_at,
+                ii.barcode,
+                ii.metal_type,
+                ii.item_image,
+                'SOLD' as status
+            FROM sale_items si
+            JOIN inventory_items ii ON si.item_id = ii.id
+            JOIN sales s ON si.sale_id = s.id
+            WHERE ii.vendor_id = $1
+            ORDER BY s.created_at DESC
+        `;
+        const result = await pool.query(query, [id]);
+        
+        const history = result.rows.map(row => ({
+            ...row,
+            item_image: row.item_image ? `data:image/jpeg;base64,${row.item_image.toString('base64')}` : null
+        }));
+        
+        res.json(history);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 module.exports = router;
