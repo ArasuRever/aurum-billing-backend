@@ -6,7 +6,16 @@ const multer = require('multer');
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// 1. ADD ITEM (Single - Legacy Support)
+const getInitials = (str) => {
+    if (!str) return 'XX';
+    return str.replace(/[^a-zA-Z ]/g, "").split(' ')
+        .map(word => word[0])
+        .join('')
+        .toUpperCase()
+        .substring(0, 3); // Max 3 chars
+};
+
+// 1. ADD ITEM (UPDATED BARCODE LOGIC)
 router.post('/add', upload.single('item_image'), async (req, res) => {
   const { 
     vendor_id, neighbour_shop_id, source_type, 
@@ -19,12 +28,19 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    const finalSource = source_type || 'VENDOR'; 
-    const prefix = metal_type ? metal_type.charAt(0).toUpperCase() : 'X';
-    const barcode = `${prefix}-${Date.now().toString(36).toUpperCase()}`;
+    // --- NEW SMART BARCODE LOGIC ---
+    const seqRes = await client.query("SELECT nextval('item_barcode_seq') as num");
+    const seqNum = seqRes.rows[0].num;
     
+    const mPrefix = metal_type === 'SILVER' ? 'S' : 'G';
+    const nameInit = getInitials(item_name);
+    // Format: G-RN-1001 (Gold Ring 1001)
+    const barcode = `${mPrefix}-${nameInit}-${seqNum}`; 
+    // -------------------------------
+
+    const finalSource = source_type || 'VENDOR'; 
     const gross = parseFloat(gross_weight) || 0;
-    const purityVal = parseFloat(wastage_percent) || 0; 
+    const purityVal = parseFloat(wastage_percent) || 0;
     
     let pure_weight = 0;
     if (req.body.pure_weight) {
