@@ -10,7 +10,7 @@ const upload = multer({ storage: storage });
 router.post('/add', upload.single('item_image'), async (req, res) => {
   const { 
     vendor_id, neighbour_shop_id, source_type, 
-    metal_type, item_name, gross_weight, wastage_percent, making_charges, stock_type, huid 
+    metal_type, item_name, gross_weight, wastage_percent, making_charges, stock_type, huid, quantity
   } = req.body;
   
   const item_image = req.file ? req.file.buffer : null;
@@ -21,7 +21,6 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
 
     const finalSource = source_type || 'VENDOR'; 
     const prefix = metal_type === 'GOLD' ? 'G' : 'S';
-    // FIXED: Short unique barcode (approx 8-9 chars) instead of long timestamp
     const barcode = `${prefix}-${Date.now().toString(36).toUpperCase()}`;
     
     const gross = parseFloat(gross_weight) || 0;
@@ -34,12 +33,14 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
         pure_weight = gross * (purityVal / 100);
     }
 
+    const qty = parseInt(quantity) || 1;
+
     // Insert Item
     const itemRes = await client.query(
       `INSERT INTO inventory_items 
-      (vendor_id, neighbour_shop_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, item_image, status, stock_type, huid)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'AVAILABLE', $12, $13) RETURNING *`,
-      [vendor_id || null, neighbour_shop_id || null, finalSource, metal_type, item_name, barcode, gross, purityVal, making_charges, pure_weight, item_image, stock_type || 'SINGLE', huid || null]
+      (vendor_id, neighbour_shop_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, item_image, status, stock_type, huid, quantity)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'AVAILABLE', $12, $13, $14) RETURNING *`,
+      [vendor_id || null, neighbour_shop_id || null, finalSource, metal_type, item_name, barcode, gross, purityVal, making_charges, pure_weight, item_image, stock_type || 'SINGLE', huid || null, qty]
     );
     const newItem = itemRes.rows[0];
 
@@ -72,7 +73,7 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
 // --- NEW: BATCH STOCK ENTRY (Groups items in Ledger) ---
 router.post('/batch-add', async (req, res) => {
   const { vendor_id, metal_type, invoice_no, items } = req.body; 
-  // items: [{ item_name, gross_weight, wastage_percent, pure_weight, item_image_base64... }, ...]
+  // items: [{ item_name, gross_weight, wastage_percent, pure_weight, item_image_base64, quantity... }, ...]
   
   const client = await pool.connect();
   try {
@@ -86,11 +87,12 @@ router.post('/batch-add', async (req, res) => {
         const g = parseFloat(i.gross_weight) || 0;
         const p = parseFloat(i.wastage_percent) || 0;
         const pure = i.pure_weight ? parseFloat(i.pure_weight) : (g * (p/100));
+        const qty = parseInt(i.quantity) || 1; // <--- Capture Quantity
         
         totalGross += g;
         totalPure += pure;
         
-        return { ...i, g, p, pure };
+        return { ...i, g, p, pure, qty };
     });
 
     // 2. Insert into stock_batches
@@ -105,15 +107,14 @@ router.post('/batch-add', async (req, res) => {
     const sourceType = vendor_id ? 'VENDOR' : 'OWN';
 
     for (const item of processedItems) {
-        // FIXED: Shorter Barcode for Batch items
         const barcode = `${metal_type.charAt(0)}-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random()*100)}`;
         const imgBuffer = item.item_image_base64 ? Buffer.from(item.item_image_base64, 'base64') : null;
 
         await client.query(
             `INSERT INTO inventory_items 
-            (vendor_id, batch_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, status, stock_type, huid, item_image)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'AVAILABLE', 'SINGLE', $11, $12)`,
-            [vendor_id || null, batchId, sourceType, metal_type, item.item_name, barcode, item.g, item.p, item.making_charges, item.pure, item.huid || null, imgBuffer]
+            (vendor_id, batch_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, status, stock_type, huid, item_image, quantity)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'AVAILABLE', $11, $12, $13, $14)`,
+            [vendor_id || null, batchId, sourceType, metal_type, item.item_name, barcode, item.g, item.p, item.making_charges, item.pure, item.stock_type || 'SINGLE', item.huid || null, imgBuffer, item.qty]
         );
     }
 

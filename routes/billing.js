@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 
-// 1. GET INVOICE DETAILS
+// 1. GET INVOICE DETAILS (Unchanged)
 router.get('/invoice/:id', async (req, res) => {
     const { id } = req.params;
     try {
@@ -19,7 +19,7 @@ router.get('/invoice/:id', async (req, res) => {
     } catch(err) { res.status(500).json({error: err.message}); }
 });
 
-// 2. SEARCH ITEMS
+// 2. SEARCH ITEMS (Unchanged)
 router.get('/search-item', async (req, res) => {
   const { q } = req.query;
   try {
@@ -35,7 +35,7 @@ router.get('/search-item', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. CREATE BILL
+// 3. CREATE BILL (UPDATED FOR BULK LOGIC)
 router.post('/create-bill', async (req, res) => {
   const { customer, items, exchangeItems, totals, includeGST } = req.body;
   const client = await pool.connect();
@@ -77,25 +77,55 @@ router.post('/create-bill', async (req, res) => {
 
     // B. Process Sale Items
     for (const item of items) {
+      // 1. Insert into sale_items
       await client.query(
         `INSERT INTO sale_items (sale_id, item_id, item_name, sold_weight, sold_rate, making_charges_collected, total_item_price) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [saleId, item.item_id || null, item.item_name, item.gross_weight, item.rate, item.making_charges || 0, item.total]
       );
 
-      // Handle Inventory & Neighbor Debt
+      // 2. Handle Inventory & Neighbor Debt
       let neighbourIdToUpdate = null;
       let weightForDebt = 0;
       let description = '';
       let metalType = item.metal_type || 'GOLD';
 
       if (item.item_id) {
-        const updateRes = await client.query(`UPDATE inventory_items SET status = 'SOLD' WHERE id = $1 RETURNING *`, [item.item_id]);
-        const dbItem = updateRes.rows[0];
-        if (dbItem && dbItem.source_type === 'NEIGHBOUR' && dbItem.neighbour_shop_id) {
-            neighbourIdToUpdate = dbItem.neighbour_shop_id;
-            weightForDebt = parseFloat(dbItem.gross_weight) || 0; 
+        // Fetch current item state to check type
+        const checkRes = await client.query(`SELECT stock_type, gross_weight, wastage_percent, source_type, neighbour_shop_id, metal_type, barcode FROM inventory_items WHERE id = $1`, [item.item_id]);
+        
+        if (checkRes.rows.length > 0) {
+            const dbItem = checkRes.rows[0];
+            const soldWt = parseFloat(item.gross_weight) || 0;
             metalType = dbItem.metal_type;
-            description = `Sold Item: ${item.item_name} (${dbItem.barcode})`;
+
+            if (dbItem.stock_type === 'BULK') {
+                // BULK LOGIC: Reduce weight, don't mark sold unless empty
+                const currentWt = parseFloat(dbItem.gross_weight);
+                const newWt = currentWt - soldWt;
+                const newPure = newWt * (parseFloat(dbItem.wastage_percent)/100);
+                
+                // If practically empty (< 0.01g), mark as SOLD, else just update weight
+                const newStatus = newWt < 0.01 ? 'SOLD' : 'AVAILABLE';
+                
+                await client.query(
+                    `UPDATE inventory_items 
+                     SET gross_weight = $1, pure_weight = $2, status = $3 
+                     WHERE id = $4`,
+                    [newWt, newPure, newStatus, item.item_id]
+                );
+                
+                description = `Bulk Sold: ${item.item_name} (${soldWt}g)`;
+            } else {
+                // SINGLE LOGIC: Mark SOLD
+                await client.query(`UPDATE inventory_items SET status = 'SOLD' WHERE id = $1`, [item.item_id]);
+                description = `Sold Item: ${item.item_name} (${dbItem.barcode})`;
+            }
+
+            // Neighbor Debt Logic
+            if (dbItem.source_type === 'NEIGHBOUR' && dbItem.neighbour_shop_id) {
+                neighbourIdToUpdate = dbItem.neighbour_shop_id;
+                weightForDebt = soldWt; // For Bulk, debt increases by amount sold
+            }
         }
       } else if (item.neighbour_id) {
           neighbourIdToUpdate = item.neighbour_id;
