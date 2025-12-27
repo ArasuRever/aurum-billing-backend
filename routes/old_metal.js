@@ -38,12 +38,14 @@ router.get('/stats', async (req, res) => {
     }
 });
 
-// 2. GET LIST (HISTORY)
+// 2. GET LIST (HISTORY) - UPDATED TO FETCH STATUS
 router.get('/list', async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT p.id, p.voucher_no, p.customer_name, p.mobile, p.date, 
-                   i.item_name, i.metal_type, i.net_weight, i.amount, p.net_payout
+                   i.item_name, i.metal_type, i.net_weight, i.amount, 
+                   p.net_payout, p.calculated_payout,
+                   i.status -- <--- ADDED STATUS CHECK
             FROM old_metal_purchases p
             JOIN old_metal_items i ON p.id = i.purchase_id
             ORDER BY p.date DESC
@@ -55,39 +57,38 @@ router.get('/list', async (req, res) => {
     }
 });
 
-// 3. ADD PURCHASE (Updated with Asset Logic & Status)
+// 3. ADD PURCHASE
 router.post('/purchase', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const { customer_name, mobile, items, total_amount, gst_deducted, net_payout, payment_mode, cash_paid, online_paid } = req.body;
+        const { 
+            customer_name, mobile, items, total_amount, gst_deducted, 
+            calculated_payout, net_payout, payment_mode, cash_paid, online_paid 
+        } = req.body;
 
-        // Generate Voucher No
         const voucherRes = await client.query("SELECT COUNT(*) FROM old_metal_purchases");
         const count = parseInt(voucherRes.rows[0].count) + 1;
         const voucher_no = `OM-${new Date().getFullYear()}-${String(count).padStart(4, '0')}`;
 
-        // Insert Purchase Record
         const purchaseRes = await client.query(`
             INSERT INTO old_metal_purchases 
-            (voucher_no, customer_name, mobile, total_amount, gst_deducted, net_payout, payment_mode, cash_paid, online_paid, date)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+            (voucher_no, customer_name, mobile, total_amount, gst_deducted, calculated_payout, net_payout, payment_mode, cash_paid, online_paid, date)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
             RETURNING id`,
-            [voucher_no, customer_name, mobile, total_amount, gst_deducted, net_payout, payment_mode, cash_paid, online_paid]
+            [voucher_no, customer_name, mobile, total_amount, gst_deducted, calculated_payout, net_payout, payment_mode, cash_paid, online_paid]
         );
         const purchaseId = purchaseRes.rows[0].id;
 
-        // Insert Items (WITH STATUS 'AVAILABLE')
         for (const item of items) {
             await client.query(`
                 INSERT INTO old_metal_items 
                 (purchase_id, item_name, metal_type, gross_weight, less_percent, less_weight, net_weight, rate, amount, status)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'AVAILABLE')`,  // <--- CHANGED
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'AVAILABLE')`,
                 [purchaseId, item.item_name, item.metal_type, item.gross_weight, item.less_percent, item.less_weight, item.net_weight, item.rate, item.amount]
             );
         }
 
-        // --- NEW: UPDATE SHOP ASSETS (Deduct Money) ---
         if (cash_paid > 0) {
             await client.query("UPDATE shop_assets SET cash_balance = cash_balance - $1 WHERE id = 1", [cash_paid]);
         }
@@ -106,14 +107,23 @@ router.post('/purchase', async (req, res) => {
     }
 });
 
-// 4. DELETE PURCHASE (Updated with Asset Reversal)
+// 4. DELETE PURCHASE - UPDATED WITH SAFETY LOCK
 router.delete('/:id', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
         const { id } = req.params;
 
-        // Fetch Purchase details first to know how much to refund
+        // A. CHECK IF LOCKED (Refinery)
+        const statusCheck = await client.query("SELECT status FROM old_metal_items WHERE purchase_id = $1", [id]);
+        const isLocked = statusCheck.rows.some(row => row.status !== 'AVAILABLE');
+
+        if (isLocked) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ message: "Cannot delete! Items are already sent to Refinery." });
+        }
+
+        // B. Fetch details for Refund logic
         const purchaseRes = await client.query("SELECT cash_paid, online_paid FROM old_metal_purchases WHERE id = $1", [id]);
         
         if (purchaseRes.rows.length === 0) {
@@ -123,13 +133,11 @@ router.delete('/:id', async (req, res) => {
 
         const { cash_paid, online_paid } = purchaseRes.rows[0];
 
-        // Delete items linked to this purchase
+        // C. Delete Data
         await client.query('DELETE FROM old_metal_items WHERE purchase_id = $1', [id]);
-
-        // Delete the purchase record
         await client.query('DELETE FROM old_metal_purchases WHERE id = $1', [id]);
 
-        // --- NEW: REVERT SHOP ASSETS (Add Money Back) ---
+        // D. Revert Assets
         if (cash_paid > 0) {
             await client.query("UPDATE shop_assets SET cash_balance = cash_balance + $1 WHERE id = 1", [cash_paid]);
         }
