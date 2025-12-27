@@ -18,11 +18,12 @@ app.use('/api/settings', require('./routes/settings'));
 app.use('/api/ledger', require('./routes/ledger'));
 app.use('/api/old-metal', require('./routes/old_metal'));
 app.use('/api/refinery', require('./routes/refinery'));
-app.use('/api/gst', require('./routes/gst_billing')); 
+app.use('/api/gst', require('./routes/gst_billing'));
+app.use('/api/dashboard', require('./routes/dashboard'));
 
-// --- ADD THIS MISSING LINE ---
-app.use('/api/dashboard', require('./routes/dashboard')); 
-// -----------------------------
+// --- NEW AUDIT ROUTE ---
+app.use('/api/audit', require('./routes/audit'));
+// -----------------------
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
