@@ -2,45 +2,46 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db'); 
 
-// 1. GET STATS (Separated by Source & Deducting Refinery Items)
+// 1. GET STATS (Calculates "Purchase" vs "Exchange" dynamically)
 router.get('/stats', async (req, res) => {
     try {
-        // A. Direct Purchases (From Old Metal Module) - Only AVAILABLE items (not in refinery)
-        const goldPurchase = await pool.query(`
-            SELECT COALESCE(SUM(net_weight), 0) as weight, COALESCE(SUM(amount), 0) as cost 
-            FROM old_metal_items WHERE metal_type = 'GOLD' AND status = 'AVAILABLE'
-        `);
-        const silverPurchase = await pool.query(`
-            SELECT COALESCE(SUM(net_weight), 0) as weight, COALESCE(SUM(amount), 0) as cost 
-            FROM old_metal_items WHERE metal_type = 'SILVER' AND status = 'AVAILABLE'
-        `);
-
-        // B. Bill Exchanges (From Inventory Module) - Only AVAILABLE items
-        // We look for stock_type 'OLD_METAL' which indicates items coming from exchanges
-        const goldExchange = await pool.query(`
-            SELECT COALESCE(SUM(gross_weight), 0) as weight
-            FROM inventory_items 
-            WHERE metal_type = 'GOLD' AND stock_type = 'OLD_METAL' AND status = 'AVAILABLE'
-        `);
-        const silverExchange = await pool.query(`
-            SELECT COALESCE(SUM(gross_weight), 0) as weight
-            FROM inventory_items 
-            WHERE metal_type = 'SILVER' AND stock_type = 'OLD_METAL' AND status = 'AVAILABLE'
+        const goldStats = await pool.query(`
+            SELECT 
+                COALESCE(SUM(CASE WHEN p.payment_mode != 'EXCHANGE' THEN i.net_weight ELSE 0 END), 0) as purchase_weight,
+                COALESCE(SUM(CASE WHEN p.payment_mode = 'EXCHANGE' THEN i.net_weight ELSE 0 END), 0) as exchange_weight,
+                COALESCE(SUM(i.net_weight), 0) as total_weight,
+                COALESCE(SUM(CASE WHEN p.payment_mode != 'EXCHANGE' THEN i.amount ELSE 0 END), 0) as cost
+            FROM old_metal_items i
+            JOIN old_metal_purchases p ON i.purchase_id = p.id
+            WHERE i.metal_type = 'GOLD' AND i.status = 'AVAILABLE'
         `);
 
-        // C. Response
+        const silverStats = await pool.query(`
+            SELECT 
+                COALESCE(SUM(CASE WHEN p.payment_mode != 'EXCHANGE' THEN i.net_weight ELSE 0 END), 0) as purchase_weight,
+                COALESCE(SUM(CASE WHEN p.payment_mode = 'EXCHANGE' THEN i.net_weight ELSE 0 END), 0) as exchange_weight,
+                COALESCE(SUM(i.net_weight), 0) as total_weight,
+                COALESCE(SUM(CASE WHEN p.payment_mode != 'EXCHANGE' THEN i.amount ELSE 0 END), 0) as cost
+            FROM old_metal_items i
+            JOIN old_metal_purchases p ON i.purchase_id = p.id
+            WHERE i.metal_type = 'SILVER' AND i.status = 'AVAILABLE'
+        `);
+
+        const g = goldStats.rows[0];
+        const s = silverStats.rows[0];
+
         res.json({
             // Gold
-            gold_purchase_weight: parseFloat(goldPurchase.rows[0].weight),
-            gold_exchange_weight: parseFloat(goldExchange.rows[0].weight),
-            gold_total_weight: parseFloat(goldPurchase.rows[0].weight) + parseFloat(goldExchange.rows[0].weight),
-            gold_cost: parseFloat(goldPurchase.rows[0].cost), // Only tracking purchase cost directly
+            gold_purchase_weight: parseFloat(g.purchase_weight),
+            gold_exchange_weight: parseFloat(g.exchange_weight),
+            gold_total_weight: parseFloat(g.total_weight),
+            gold_cost: parseFloat(g.cost),
             
             // Silver
-            silver_purchase_weight: parseFloat(silverPurchase.rows[0].weight),
-            silver_exchange_weight: parseFloat(silverExchange.rows[0].weight),
-            silver_total_weight: parseFloat(silverPurchase.rows[0].weight) + parseFloat(silverExchange.rows[0].weight),
-            silver_cost: parseFloat(silverPurchase.rows[0].cost)
+            silver_purchase_weight: parseFloat(s.purchase_weight),
+            silver_exchange_weight: parseFloat(s.exchange_weight),
+            silver_total_weight: parseFloat(s.total_weight),
+            silver_cost: parseFloat(s.cost)
         });
     } catch (err) {
         console.error(err);
@@ -54,7 +55,7 @@ router.get('/list', async (req, res) => {
         const result = await pool.query(`
             SELECT p.id, p.voucher_no, p.customer_name, p.mobile, p.date, 
                    i.item_name, i.metal_type, i.gross_weight, i.net_weight, i.amount, 
-                   p.net_payout, p.calculated_payout,
+                   p.net_payout, p.calculated_payout, p.payment_mode,
                    i.status
             FROM old_metal_purchases p
             JOIN old_metal_items i ON p.id = i.purchase_id
@@ -67,7 +68,7 @@ router.get('/list', async (req, res) => {
     }
 });
 
-// 3. ADD PURCHASE
+// 3. ADD PURCHASE (Unchanged)
 router.post('/purchase', async (req, res) => {
     const client = await pool.connect();
     try {
@@ -117,7 +118,7 @@ router.post('/purchase', async (req, res) => {
     }
 });
 
-// 4. DELETE PURCHASE
+// 4. DELETE PURCHASE (Unchanged)
 router.delete('/:id', async (req, res) => {
     const client = await pool.connect();
     try {
