@@ -103,11 +103,12 @@ router.get('/history', async (req, res) => {
 
                 UNION ALL
 
-                -- 5. OLD METAL (Includes Exchanges) - UPDATED TO FETCH WEIGHTS
+                -- 5. OLD METAL (Includes Exchanges) - *** FIXED SECTION ***
                 SELECT p.id, 
                        'OLD_METAL' as type, 
                        CONCAT(CASE WHEN p.payment_mode='EXCHANGE' THEN 'Bill Exchange: ' ELSE 'Bought from ' END, p.customer_name, ' (', p.voucher_no, ')'), 
                        p.net_payout as cash_amount, 
+                       -- Fetch actual weights from items table
                        (SELECT COALESCE(SUM(net_weight), 0) FROM old_metal_items WHERE purchase_id = p.id AND metal_type = 'GOLD') as gold_weight, 
                        (SELECT COALESCE(SUM(net_weight), 0) FROM old_metal_items WHERE purchase_id = p.id AND metal_type = 'SILVER') as silver_weight,
                        p.payment_mode, 
@@ -161,8 +162,6 @@ router.get('/history', async (req, res) => {
                 dayStats.silver_in += sw;
             } 
             else if (row.type === 'VENDOR_TXN') {
-                // Determine direction based on context or simple heuristic (Stock Added = IN)
-                // This matches the query logic where STOCK_ADDED usually has direction 'IN'
                 if(row.direction === 'IN') {
                     dayStats.gold_in += gw;
                     dayStats.silver_in += sw;

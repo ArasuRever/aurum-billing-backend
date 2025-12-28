@@ -35,7 +35,7 @@ router.get('/search-item', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. CREATE BILL (CRITICAL UPDATE: Exchange -> Old Metal)
+// 3. CREATE BILL (ROBUST VERSION)
 router.post('/create-bill', async (req, res) => {
   const { customer, items, exchangeItems, totals, includeGST } = req.body;
   const client = await pool.connect();
@@ -136,10 +136,9 @@ router.post('/create-bill', async (req, res) => {
       }
     }
 
-    // C. Exchange Items (THIS IS THE FIX)
+    // C. Exchange Items (Updated with Auto-Calculation)
     if (exchangeItems && exchangeItems.length > 0) {
       
-      // 1. Create a virtual "Old Metal Purchase" linked to this Bill
       const exTotal = exchangeItems.reduce((sum, ex) => sum + parseFloat(ex.total), 0);
       
       const omRes = await client.query(
@@ -151,18 +150,26 @@ router.post('/create-bill', async (req, res) => {
       const omId = omRes.rows[0].id;
 
       for (const ex of exchangeItems) {
-        // 2. Add to Sale Record (For Invoice UI)
+        // Robust Weight Calculation
+        const gross = parseFloat(ex.gross_weight) || 0;
+        const less = parseFloat(ex.less_weight) || 0;
+        let net = parseFloat(ex.net_weight) || 0;
+        
+        // If net is missing/zero but gross exists, calculate it
+        if (net <= 0 && gross > 0) {
+            net = gross - less;
+        }
+
         await client.query(
           `INSERT INTO sale_exchange_items (sale_id, item_name, metal_type, gross_weight, less_percent, less_weight, net_weight, rate, total_amount) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-          [saleId, ex.name, ex.metal_type, ex.gross_weight, ex.less_percent, ex.less_weight, ex.net_weight, ex.rate, ex.total]
+          [saleId, ex.name, ex.metal_type, gross, ex.less_percent, less, net, ex.rate, ex.total]
         );
 
-        // 3. Add to Old Metal Stock (Visible in Refinery & Ledger)
         await client.query(`
             INSERT INTO old_metal_items 
             (purchase_id, item_name, metal_type, gross_weight, less_percent, less_weight, net_weight, rate, amount, status)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'AVAILABLE')`,
-            [omId, ex.name, ex.metal_type, ex.gross_weight, ex.less_percent, ex.less_weight, ex.net_weight, ex.rate, ex.total]
+            [omId, ex.name, ex.metal_type, gross, ex.less_percent, less, net, ex.rate, ex.total]
         );
       }
     }
@@ -207,7 +214,7 @@ router.get('/history', async (req, res) => {
     try { const result = await pool.query(`SELECT * FROM sales ORDER BY id DESC`); res.json(result.rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 7. DELETE BILL (Handles Neighbour & Exchange Reversal)
+// 7. DELETE BILL (Standard)
 router.delete('/delete/:id', async (req, res) => {
     const { id } = req.params;
     const { restore_mode } = req.query; 
@@ -216,7 +223,6 @@ router.delete('/delete/:id', async (req, res) => {
     try {
       await client.query('BEGIN');
 
-      // 1. Fetch Items
       const itemsRes = await client.query(`SELECT * FROM sale_items WHERE sale_id = $1`, [id]);
       
       for (const saleItem of itemsRes.rows) {
@@ -238,11 +244,8 @@ router.delete('/delete/:id', async (req, res) => {
                       const shopId = invItem.neighbour_shop_id;
                       const isSilver = invItem.metal_type === 'SILVER';
 
-                      if (isSilver) {
-                          await client.query(`UPDATE external_shops SET balance_silver = balance_silver - $1 WHERE id = $2`, [weight, shopId]);
-                      } else {
-                          await client.query(`UPDATE external_shops SET balance_gold = balance_gold - $1 WHERE id = $2`, [weight, shopId]);
-                      }
+                      if (isSilver) await client.query(`UPDATE external_shops SET balance_silver = balance_silver - $1 WHERE id = $2`, [weight, shopId]);
+                      else await client.query(`UPDATE external_shops SET balance_gold = balance_gold - $1 WHERE id = $2`, [weight, shopId]);
 
                       await client.query(
                           `INSERT INTO shop_transactions (shop_id, type, description, gross_weight, pure_weight, silver_weight, cash_amount) 
@@ -270,17 +273,13 @@ router.delete('/delete/:id', async (req, res) => {
           }
       }
 
-      // 2. Delete Exchange Records (Reversal)
       const saleInfo = await client.query("SELECT invoice_number FROM sales WHERE id = $1", [id]);
       if(saleInfo.rows.length > 0) {
           const invNo = saleInfo.rows[0].invoice_number;
-          // Delete items first (FK constraint)
           await client.query("DELETE FROM old_metal_items WHERE purchase_id IN (SELECT id FROM old_metal_purchases WHERE voucher_no = $1)", [`EX-${invNo}`]);
-          // Delete purchase header
           await client.query("DELETE FROM old_metal_purchases WHERE voucher_no = $1", [`EX-${invNo}`]);
       }
 
-      // 3. Delete Bill Records
       await client.query("DELETE FROM sale_items WHERE sale_id = $1", [id]);
       await client.query("DELETE FROM sale_payments WHERE sale_id = $1", [id]);
       await client.query("DELETE FROM sale_exchange_items WHERE sale_id = $1", [id]);
@@ -293,23 +292,19 @@ router.delete('/delete/:id', async (req, res) => {
 
 // 8. PROCESS RETURN (Standard)
 router.post('/process-return', async (req, res) => {
-    const { sale_id, customer_id, returned_items, exchange_items } = req.body;
+    const { returned_items } = req.body;
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
         
-        let totalRefund = 0;
         for (const item of returned_items) {
-             totalRefund += parseFloat(item.refund_amount);
              const invRes = await client.query("SELECT * FROM inventory_items WHERE id = $1", [item.original_inventory_id]);
              const invItem = invRes.rows[0];
              
              if(invItem) {
                  if (item.restore_to_own && invItem.source_type === 'NEIGHBOUR') {
-                     // Logic handled in previous complex block, simplified here for 'AVAILABLE' restore
                      await client.query("UPDATE inventory_items SET status='AVAILABLE', source_type='OWN', neighbour_shop_id=NULL WHERE id=$1", [item.original_inventory_id]);
                  } else if (invItem.source_type === 'NEIGHBOUR') {
-                     // Reverse Debt logic
                      const weight = parseFloat(item.gross_weight);
                      const shopId = invItem.neighbour_shop_id;
                      const isSilver = invItem.metal_type === 'SILVER';
