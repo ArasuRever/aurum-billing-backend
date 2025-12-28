@@ -15,7 +15,7 @@ const getInitials = (str) => {
         .substring(0, 3); // Max 3 chars
 };
 
-// 1. ADD ITEM (UPDATED BARCODE LOGIC)
+// 1. ADD ITEM (Smart Barcode Logic)
 router.post('/add', upload.single('item_image'), async (req, res) => {
   const { 
     vendor_id, neighbour_shop_id, source_type, 
@@ -28,7 +28,7 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // --- NEW SMART BARCODE LOGIC ---
+    // --- SMART BARCODE LOGIC ---
     const seqRes = await client.query("SELECT nextval('item_barcode_seq') as num");
     const seqNum = seqRes.rows[0].num;
     
@@ -51,11 +51,11 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
 
     const qty = parseInt(quantity) || 1;
 
-    // Insert Item
+    // Insert Item (Default is_deleted = FALSE)
     const itemRes = await client.query(
       `INSERT INTO inventory_items 
-      (vendor_id, neighbour_shop_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, item_image, status, stock_type, huid, quantity)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'AVAILABLE', $12, $13, $14) RETURNING *`,
+      (vendor_id, neighbour_shop_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, item_image, status, stock_type, huid, quantity, is_deleted)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'AVAILABLE', $12, $13, $14, FALSE) RETURNING *`,
       [vendor_id || null, neighbour_shop_id || null, finalSource, metal_type, item_name, barcode, gross, purityVal, making_charges, pure_weight, item_image, stock_type || 'SINGLE', huid || null, qty]
     );
     const newItem = itemRes.rows[0];
@@ -126,8 +126,8 @@ router.post('/batch-add', async (req, res) => {
 
         await client.query(
             `INSERT INTO inventory_items 
-            (vendor_id, batch_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, status, stock_type, huid, item_image, quantity)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'AVAILABLE', $11, $12, $13, $14)`,
+            (vendor_id, batch_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, status, stock_type, huid, item_image, quantity, is_deleted)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'AVAILABLE', $11, $12, $13, $14, FALSE)`,
             [vendor_id || null, batchId, sourceType, metal_type, item.item_name, barcode, item.g, item.p, item.making_charges, item.pure, item.stock_type || 'SINGLE', item.huid || null, imgBuffer, item.qty]
         );
     }
@@ -162,7 +162,7 @@ router.post('/batch-add', async (req, res) => {
   }
 });
 
-// 3. LIST ALL ITEMS
+// 3. LIST ALL ITEMS (Filtered by status and is_deleted)
 router.get('/list', async (req, res) => {
   try {
     const result = await pool.query(`
@@ -170,7 +170,8 @@ router.get('/list', async (req, res) => {
         FROM inventory_items i
         LEFT JOIN vendors v ON i.vendor_id = v.id
         LEFT JOIN external_shops n ON i.neighbour_shop_id = n.id
-        WHERE i.status = 'AVAILABLE' ORDER BY i.created_at DESC`
+        WHERE i.status = 'AVAILABLE' AND (i.is_deleted IS FALSE OR i.is_deleted IS NULL)
+        ORDER BY i.created_at DESC`
     );
     const items = result.rows.map(item => ({
       ...item,
@@ -183,21 +184,34 @@ router.get('/list', async (req, res) => {
 // 4. VENDOR SPECIFIC INVENTORY (Current Stock)
 router.get('/vendor/:id', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM inventory_items WHERE vendor_id = $1 ORDER BY created_at DESC', [req.params.id]);
+    const result = await pool.query(
+        `SELECT * FROM inventory_items 
+         WHERE vendor_id = $1 AND (is_deleted IS FALSE OR is_deleted IS NULL)
+         ORDER BY created_at DESC`, 
+         [req.params.id]
+    );
     const items = result.rows.map(item => ({...item, item_image: item.item_image ? `data:image/jpeg;base64,${item.item_image.toString('base64')}` : null}));
     res.json(items);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 5. UPDATE ITEM
+// 5. UPDATE ITEM (With Status Safeguard)
 router.put('/update/:id', async (req, res) => {
   const { id } = req.params;
   const { gross_weight, wastage_percent, update_comment } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    
+    // 1. Fetch Item & Check Status
     const oldRes = await client.query('SELECT * FROM inventory_items WHERE id = $1', [id]);
     const oldItem = oldRes.rows[0];
+    
+    // SAFEGUARD: Prevent editing if Sold or Batched
+    if (oldItem.status !== 'AVAILABLE') {
+        throw new Error(`Cannot edit item. Current status is ${oldItem.status}`);
+    }
+
     const newGross = parseFloat(gross_weight);
     const newPurity = parseFloat(wastage_percent);
     const newPure = newGross * (newPurity / 100); 
@@ -219,17 +233,26 @@ router.put('/update/:id', async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// 6. DELETE ITEM
+// 6. DELETE ITEM (Converted to Soft Delete)
 router.delete('/:id', async (req, res) => {
   const { id } = req.params;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    
     const itemRes = await client.query('SELECT * FROM inventory_items WHERE id = $1', [id]);
     const item = itemRes.rows[0];
     
     if (item) {
-        await client.query('DELETE FROM inventory_items WHERE id = $1', [id]);
+        // Prevent deleting sold items via this route (Sales deletion handles that)
+        if (item.status === 'SOLD') {
+            throw new Error("Cannot delete a SOLD item directly. Please delete the Bill instead.");
+        }
+
+        // SOFT DELETE: Mark as deleted but keep record
+        await client.query("UPDATE inventory_items SET status='DELETED', is_deleted=TRUE WHERE id = $1", [id]);
+        
+        // REVERSE VENDOR BALANCE
         if (item.source_type === 'VENDOR' && item.vendor_id) {
             const reduction = parseFloat(item.pure_weight) || 0;
             await client.query('UPDATE vendors SET balance_pure_weight = balance_pure_weight - $1 WHERE id = $2', [reduction, item.vendor_id]);
@@ -245,7 +268,7 @@ router.delete('/:id', async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// --- 7. NEW: VENDOR SALES HISTORY (For Sold Items List) ---
+// --- 7. VENDOR SALES HISTORY ---
 router.get('/vendor-history/:id', async (req, res) => {
     try {
         const { id } = req.params;

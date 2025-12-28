@@ -80,10 +80,25 @@ router.get('/batches', async (req, res) => {
     }
 });
 
-// 4. RECEIVE REFINED GOLD
+// 4. RECEIVE REFINED GOLD (WITH SECURITY CHECK)
 router.post('/receive-refined', async (req, res) => {
     const { batch_id, refined_weight, pure_weight } = req.body;
     try {
+        // --- SECURITY VALIDATION ---
+        const batchRes = await pool.query("SELECT gross_weight FROM refinery_batches WHERE id = $1", [batch_id]);
+        if (batchRes.rows.length === 0) return res.status(404).json({ error: "Batch not found" });
+
+        const sentWeight = parseFloat(batchRes.rows[0].gross_weight);
+        const receivedPure = parseFloat(pure_weight);
+
+        // Allow a tiny margin of error (0.01g) for scale differences, but generally pure cannot exceed gross sent.
+        if (receivedPure > sentWeight + 0.01) {
+            return res.status(400).json({ 
+                error: `Security Alert: Received pure weight (${receivedPure}g) cannot exceed sent gross weight (${sentWeight}g)!` 
+            });
+        }
+        // ---------------------------
+
         await pool.query(`
             UPDATE refinery_batches 
             SET refined_weight = $1, pure_weight = $2, status = 'REFINED', received_date = NOW()
@@ -117,15 +132,14 @@ router.post('/use-stock', async (req, res) => {
         }
 
         // 2. Add to Inventory as new item (Source: REFINERY)
-        // Auto-generate barcode logic here if needed, simplified for now
         const seqRes = await client.query("SELECT nextval('item_barcode_seq') as num");
         const barcode = `${metal_type.charAt(0)}R-${seqRes.rows[0].num}`;
 
         await client.query(`
             INSERT INTO inventory_items (
                 metal_type, item_name, gross_weight, pure_weight, wastage_percent, 
-                source_type, status, barcode, quantity
-            ) VALUES ($1, $2, $3, $3, 0, 'REFINERY', 'AVAILABLE', $4, 1)
+                source_type, status, barcode, quantity, is_deleted
+            ) VALUES ($1, $2, $3, $3, 0, 'REFINERY', 'AVAILABLE', $4, 1, FALSE)
         `, [metal_type, item_name || 'Refined Bar', use_weight, barcode]);
 
         // 3. Update Batch Used Weight
@@ -146,7 +160,7 @@ router.post('/use-stock', async (req, res) => {
     }
 });
 
-// 6. GET BATCH ITEMS HISTORY (NEW ROUTE)
+// 6. GET BATCH ITEMS HISTORY
 router.get('/batch/:id/items', async (req, res) => {
     try {
         const { id } = req.params;

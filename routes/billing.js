@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 
-// 1. GET INVOICE DETAILS (Unchanged)
+// 1. GET INVOICE DETAILS
 router.get('/invoice/:id', async (req, res) => {
     const { id } = req.params;
     try {
@@ -19,7 +19,7 @@ router.get('/invoice/:id', async (req, res) => {
     } catch(err) { res.status(500).json({error: err.message}); }
 });
 
-// 2. SEARCH ITEMS (Unchanged)
+// 2. SEARCH ITEMS
 router.get('/search-item', async (req, res) => {
   const { q } = req.query;
   try {
@@ -35,7 +35,7 @@ router.get('/search-item', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. CREATE BILL (UPDATED FOR BULK LOGIC)
+// 3. CREATE BILL
 router.post('/create-bill', async (req, res) => {
   const { customer, items, exchangeItems, totals, includeGST } = req.body;
   const client = await pool.connect();
@@ -205,38 +205,110 @@ router.get('/history', async (req, res) => {
     try { const result = await pool.query(`SELECT * FROM sales ORDER BY id DESC`); res.json(result.rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 7. DELETE BILL
+// 7. DELETE BILL (MODIFIED: Handles Neighbour Restore Logic)
 router.delete('/delete/:id', async (req, res) => {
     const { id } = req.params;
+    // restore_mode: 'REVERT_DEBT' (default) or 'TAKE_OWNERSHIP'
+    const { restore_mode } = req.query; 
+
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
-      // A. Fetch Items to restore
-      const itemsRes = await client.query(`SELECT item_id FROM sale_items WHERE sale_id = $1 AND item_id IS NOT NULL`, [id]);
+      // 1. Fetch Items sold in this bill
+      const itemsRes = await client.query(`SELECT * FROM sale_items WHERE sale_id = $1`, [id]);
       
-      for (const row of itemsRes.rows) {
-          // RESTORE TO INVENTORY
-          // Simply make it available again. We do NOT revert ownership because voiding a bill is ambiguous 
-          // regarding the debt created. For now, we assume the debt remains until manually adjusted, 
-          // or you might want to enhance this to reverse the debt transaction if possible.
-          await client.query(
-              `UPDATE inventory_items SET status = 'AVAILABLE' WHERE id = $1`, 
-              [row.item_id]
-          );
+      for (const saleItem of itemsRes.rows) {
+          if (!saleItem.item_id) continue; 
+
+          // Get current item details (even if sold)
+          const invRes = await client.query(`SELECT * FROM inventory_items WHERE id = $1`, [saleItem.item_id]);
+          const invItem = invRes.rows[0];
+
+          if (invItem) {
+              let newSource = invItem.source_type;
+              let newNeighbourId = invItem.neighbour_shop_id;
+
+              // --- LOGIC: HANDLE NEIGHBOUR ITEMS ---
+              if (invItem.source_type === 'NEIGHBOUR' && invItem.neighbour_shop_id) {
+                  
+                  if (restore_mode === 'TAKE_OWNERSHIP') {
+                      // Option A: Keep Debt, Make it OUR Item
+                      // We change source to OWN, meaning we effectively 'bought' it.
+                      // The debt created during sale remains valid.
+                      newSource = 'OWN';
+                      newNeighbourId = null;
+                      
+                      // Optional: Update the original 'BORROW_ADD' transaction description?
+                      // For now, we leave it as is, as the debt is still valid.
+                  } 
+                  else {
+                      // Option B (Default): Reverse Debt, Return to NEIGHBOUR Status
+                      // We assume the sale never happened, so we shouldn't owe the neighbor.
+                      
+                      const weight = parseFloat(saleItem.sold_weight);
+                      const shopId = invItem.neighbour_shop_id;
+                      const isSilver = invItem.metal_type === 'SILVER';
+
+                      // 1. Deduct from Shop Balance (Reversing the ADD)
+                      if (isSilver) {
+                          await client.query(`UPDATE external_shops SET balance_silver = balance_silver - $1 WHERE id = $2`, [weight, shopId]);
+                      } else {
+                          await client.query(`UPDATE external_shops SET balance_gold = balance_gold - $1 WHERE id = $2`, [weight, shopId]);
+                      }
+
+                      // 2. Add Reversal Transaction (So ledger matches balance)
+                      await client.query(
+                          `INSERT INTO shop_transactions (shop_id, type, description, gross_weight, pure_weight, silver_weight, cash_amount) 
+                           VALUES ($1, 'BORROW_REPAY', $2, $3, $4, $5, 0)`,
+                          [
+                              shopId, 
+                              `Void Bill: ${saleItem.item_name} (Reversal)`, 
+                              weight, 
+                              isSilver ? 0 : weight, // Gold 
+                              isSilver ? weight : 0  // Silver
+                          ]
+                      );
+                  }
+              }
+
+              // --- RESTORE INVENTORY ---
+              // Handle Bulk vs Single Logic
+              if (invItem.stock_type === 'BULK') {
+                  const soldWt = parseFloat(saleItem.sold_weight);
+                  const purity = parseFloat(invItem.wastage_percent);
+                  const pureWt = soldWt * (purity / 100);
+                  
+                  await client.query(
+                      `UPDATE inventory_items 
+                       SET gross_weight = gross_weight + $1, pure_weight = pure_weight + $2, status = 'AVAILABLE',
+                           source_type = $3, neighbour_shop_id = $4
+                       WHERE id = $5`,
+                      [soldWt, pureWt, newSource, newNeighbourId, invItem.id]
+                  );
+              } else {
+                  await client.query(
+                      `UPDATE inventory_items 
+                       SET status = 'AVAILABLE', source_type = $1, neighbour_shop_id = $2 
+                       WHERE id = $3`,
+                      [newSource, newNeighbourId, invItem.id]
+                  );
+              }
+          }
       }
 
-      // B. Delete Bill Records
+      // 2. Delete Bill Records
       await client.query("DELETE FROM sale_items WHERE sale_id = $1", [id]);
+      await client.query("DELETE FROM sale_payments WHERE sale_id = $1", [id]);
       await client.query("DELETE FROM sale_exchange_items WHERE sale_id = $1", [id]);
       await client.query("DELETE FROM sales WHERE id = $1", [id]);
       
       await client.query('COMMIT');
-      res.json({ success: true, message: "Bill Voided. Items restored." });
+      res.json({ success: true, message: "Bill Voided Successfully" });
     } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// 8. PROCESS RETURN / EXCHANGE
+// 8. PROCESS RETURN / EXCHANGE (MODIFIED: Handles Neighbour Restore Logic)
 router.post('/process-return', async (req, res) => {
     const { sale_id, customer_id, returned_items, exchange_items } = req.body;
     const client = await pool.connect();
@@ -249,17 +321,63 @@ router.post('/process-return', async (req, res) => {
         for (const item of returned_items) {
             totalRefund += parseFloat(item.refund_amount);
 
-            // LOGIC CHANGE:
-            // If item was NEIGHBOUR -> Become OWN (Inshop) because debt is already active.
-            // If item was VENDOR -> Stay VENDOR (Goes back to vendor stock).
-            await client.query(
-                `UPDATE inventory_items 
-                 SET status = 'AVAILABLE',
-                     source_type = CASE WHEN source_type = 'NEIGHBOUR' THEN 'OWN' ELSE source_type END,
-                     neighbour_shop_id = CASE WHEN source_type = 'NEIGHBOUR' THEN NULL ELSE neighbour_shop_id END
-                 WHERE id = $1`, 
-                [item.original_inventory_id]
-            );
+            // Fetch original info to check source
+            const invRes = await client.query("SELECT * FROM inventory_items WHERE id = $1", [item.original_inventory_id]);
+            const invItem = invRes.rows[0];
+
+            if (invItem) {
+                let newSource = invItem.source_type;
+                let newNeighbourId = invItem.neighbour_shop_id;
+
+                // CHECK: Did user choose to take ownership?
+                if (invItem.source_type === 'NEIGHBOUR') {
+                    if (item.restore_to_own === true) {
+                        // A: Take Ownership (Debt Stays)
+                        newSource = 'OWN';
+                        newNeighbourId = null;
+                    } else {
+                        // B: Return to Neighbour (Reverse Debt) - Default behavior for returns usually
+                        const weight = parseFloat(item.gross_weight); 
+                        const shopId = invItem.neighbour_shop_id;
+                        const isSilver = invItem.metal_type === 'SILVER';
+
+                        // Deduct debt
+                        if (isSilver) await client.query(`UPDATE external_shops SET balance_silver = balance_silver - $1 WHERE id = $2`, [weight, shopId]);
+                        else await client.query(`UPDATE external_shops SET balance_gold = balance_gold - $1 WHERE id = $2`, [weight, shopId]);
+                        
+                        // Log Transaction
+                        await client.query(
+                           `INSERT INTO shop_transactions (shop_id, type, description, gross_weight, pure_weight, silver_weight) 
+                            VALUES ($1, 'BORROW_REPAY', $2, $3, $4, $5)`,
+                           [shopId, `Return: ${invItem.item_name}`, weight, (isSilver?0:weight), (isSilver?weight:0)]
+                        );
+                    }
+                }
+
+                // Restore Item
+                if (invItem.stock_type === 'BULK') {
+                    // If returning bulk, we add weight back
+                    const soldWt = parseFloat(item.gross_weight);
+                    const purity = parseFloat(invItem.wastage_percent);
+                    const pureWt = soldWt * (purity / 100);
+                    
+                     await client.query(
+                        `UPDATE inventory_items 
+                         SET gross_weight = gross_weight + $1, pure_weight = pure_weight + $2, status = 'AVAILABLE',
+                             source_type = $3, neighbour_shop_id = $4
+                         WHERE id = $5`, 
+                        [soldWt, pureWt, newSource, newNeighbourId, item.original_inventory_id]
+                    );
+
+                } else {
+                    await client.query(
+                        `UPDATE inventory_items 
+                         SET status = 'AVAILABLE', source_type = $1, neighbour_shop_id = $2
+                         WHERE id = $3`, 
+                        [newSource, newNeighbourId, item.original_inventory_id]
+                    );
+                }
+            }
         }
 
         // 2. HANDLE EXCHANGE (Create New Sale for Exchange Items)
