@@ -103,19 +103,19 @@ router.get('/history', async (req, res) => {
 
                 UNION ALL
 
-                -- 5. OLD METAL
-                SELECT id, 
+                -- 5. OLD METAL (Includes Exchanges) - UPDATED TO FETCH WEIGHTS
+                SELECT p.id, 
                        'OLD_METAL' as type, 
-                       CONCAT('Bought from ', customer_name, ' (', voucher_no, ')') as description, 
-                       net_payout as cash_amount, 
-                       0::numeric as gold_weight, 
-                       0::numeric as silver_weight,
-                       payment_mode, 
-                       date, 
+                       CONCAT(CASE WHEN p.payment_mode='EXCHANGE' THEN 'Bill Exchange: ' ELSE 'Bought from ' END, p.customer_name, ' (', p.voucher_no, ')'), 
+                       p.net_payout as cash_amount, 
+                       (SELECT COALESCE(SUM(net_weight), 0) FROM old_metal_items WHERE purchase_id = p.id AND metal_type = 'GOLD') as gold_weight, 
+                       (SELECT COALESCE(SUM(net_weight), 0) FROM old_metal_items WHERE purchase_id = p.id AND metal_type = 'SILVER') as silver_weight,
+                       p.payment_mode, 
+                       p.date, 
                        'OUT' as direction,
                        NULL::integer as reference_id, 
                        NULL::text as reference_type
-                FROM old_metal_purchases
+                FROM old_metal_purchases p
 
                 UNION ALL
                 
@@ -148,16 +148,38 @@ router.get('/history', async (req, res) => {
             const gw = parseFloat(row.gold_weight || 0);
             const sw = parseFloat(row.silver_weight || 0);
 
+            // 1. CASH LOGIC
             if (amt > 0) {
                 if(row.direction === 'IN') dayStats.income += amt;
                 else dayStats.expense += amt;
             }
-            if(row.direction === 'IN') {
+
+            // 2. METAL LOGIC (Corrected for Old Metal)
+            if (row.type === 'OLD_METAL') {
+                // Old Metal is special: Money goes OUT (Expense), but Metal comes IN (Stock)
                 dayStats.gold_in += gw;
                 dayStats.silver_in += sw;
-            } else {
-                dayStats.gold_out += gw;
-                dayStats.silver_out += sw;
+            } 
+            else if (row.type === 'VENDOR_TXN') {
+                // Determine direction based on context or simple heuristic (Stock Added = IN)
+                // This matches the query logic where STOCK_ADDED usually has direction 'IN'
+                if(row.direction === 'IN') {
+                    dayStats.gold_in += gw;
+                    dayStats.silver_in += sw;
+                } else {
+                    dayStats.gold_out += gw;
+                    dayStats.silver_out += sw;
+                }
+            }
+            else {
+                // Standard Logic for other types
+                if(row.direction === 'IN') {
+                    dayStats.gold_in += gw;
+                    dayStats.silver_in += sw;
+                } else {
+                    dayStats.gold_out += gw;
+                    dayStats.silver_out += sw;
+                }
             }
         });
 
