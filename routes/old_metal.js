@@ -2,35 +2,45 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db'); 
 
-// 1. GET STATS (Aggregated: Direct Purchase + Bill Exchange)
+// 1. GET STATS (Separated by Source & Deducting Refinery Items)
 router.get('/stats', async (req, res) => {
     try {
-        // A. Direct Purchases
+        // A. Direct Purchases (From Old Metal Module) - Only AVAILABLE items (not in refinery)
         const goldPurchase = await pool.query(`
             SELECT COALESCE(SUM(net_weight), 0) as weight, COALESCE(SUM(amount), 0) as cost 
-            FROM old_metal_items WHERE metal_type = 'GOLD'
+            FROM old_metal_items WHERE metal_type = 'GOLD' AND status = 'AVAILABLE'
         `);
         const silverPurchase = await pool.query(`
             SELECT COALESCE(SUM(net_weight), 0) as weight, COALESCE(SUM(amount), 0) as cost 
-            FROM old_metal_items WHERE metal_type = 'SILVER'
+            FROM old_metal_items WHERE metal_type = 'SILVER' AND status = 'AVAILABLE'
         `);
 
-        // B. Bill Exchanges
+        // B. Bill Exchanges (From Inventory Module) - Only AVAILABLE items
+        // We look for stock_type 'OLD_METAL' which indicates items coming from exchanges
         const goldExchange = await pool.query(`
-            SELECT COALESCE(SUM(net_weight), 0) as weight, COALESCE(SUM(total_amount), 0) as cost 
-            FROM sale_exchange_items WHERE metal_type = 'GOLD'
+            SELECT COALESCE(SUM(gross_weight), 0) as weight
+            FROM inventory_items 
+            WHERE metal_type = 'GOLD' AND stock_type = 'OLD_METAL' AND status = 'AVAILABLE'
         `);
         const silverExchange = await pool.query(`
-            SELECT COALESCE(SUM(net_weight), 0) as weight, COALESCE(SUM(total_amount), 0) as cost 
-            FROM sale_exchange_items WHERE metal_type = 'SILVER'
+            SELECT COALESCE(SUM(gross_weight), 0) as weight
+            FROM inventory_items 
+            WHERE metal_type = 'SILVER' AND stock_type = 'OLD_METAL' AND status = 'AVAILABLE'
         `);
 
-        // C. Combine
+        // C. Response
         res.json({
-            gold_weight: parseFloat(goldPurchase.rows[0].weight) + parseFloat(goldExchange.rows[0].weight),
-            gold_cost: parseFloat(goldPurchase.rows[0].cost) + parseFloat(goldExchange.rows[0].cost),
-            silver_weight: parseFloat(silverPurchase.rows[0].weight) + parseFloat(silverExchange.rows[0].weight),
-            silver_cost: parseFloat(silverPurchase.rows[0].cost) + parseFloat(silverExchange.rows[0].cost)
+            // Gold
+            gold_purchase_weight: parseFloat(goldPurchase.rows[0].weight),
+            gold_exchange_weight: parseFloat(goldExchange.rows[0].weight),
+            gold_total_weight: parseFloat(goldPurchase.rows[0].weight) + parseFloat(goldExchange.rows[0].weight),
+            gold_cost: parseFloat(goldPurchase.rows[0].cost), // Only tracking purchase cost directly
+            
+            // Silver
+            silver_purchase_weight: parseFloat(silverPurchase.rows[0].weight),
+            silver_exchange_weight: parseFloat(silverExchange.rows[0].weight),
+            silver_total_weight: parseFloat(silverPurchase.rows[0].weight) + parseFloat(silverExchange.rows[0].weight),
+            silver_cost: parseFloat(silverPurchase.rows[0].cost)
         });
     } catch (err) {
         console.error(err);
@@ -38,7 +48,7 @@ router.get('/stats', async (req, res) => {
     }
 });
 
-// 2. GET LIST (HISTORY) - Updated to fetch Gross Weight
+// 2. GET LIST (HISTORY)
 router.get('/list', async (req, res) => {
     try {
         const result = await pool.query(`
@@ -114,7 +124,6 @@ router.delete('/:id', async (req, res) => {
         await client.query('BEGIN');
         const { id } = req.params;
 
-        // Check if locked
         const statusCheck = await client.query("SELECT status FROM old_metal_items WHERE purchase_id = $1", [id]);
         const isLocked = statusCheck.rows.some(row => row.status !== 'AVAILABLE');
 

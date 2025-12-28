@@ -33,7 +33,15 @@ router.get('/search', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. UPDATE VENDOR DETAILS
+// 3. GET ALL VENDORS (WAS MISSING)
+router.get('/list', async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM vendors ORDER BY id DESC");
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 4. UPDATE VENDOR DETAILS
 router.put('/:id', async (req, res) => {
   const { id } = req.params;
   const { business_name, contact_number, address, gst_number, vendor_type } = req.body;
@@ -48,7 +56,7 @@ router.put('/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. ADD AGENT
+// 5. ADD AGENT
 router.post('/add-agent', upload.single('agent_photo'), async (req, res) => {
   const { vendor_id, agent_name, agent_phone } = req.body;
   const agent_photo = req.file ? req.file.buffer : null;
@@ -61,7 +69,7 @@ router.post('/add-agent', upload.single('agent_photo'), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 5. GET AGENTS
+// 6. GET AGENTS
 router.get('/:id/agents', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM vendor_agents WHERE vendor_id = $1 ORDER BY id DESC', [req.params.id]);
@@ -73,7 +81,7 @@ router.get('/:id/agents', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 6. UPDATE AGENT
+// 7. UPDATE AGENT
 router.put('/agent/:id', upload.single('agent_photo'), async (req, res) => {
   const { id } = req.params;
   const { agent_name, agent_phone } = req.body;
@@ -89,7 +97,7 @@ router.put('/agent/:id', upload.single('agent_photo'), async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 7. DELETE AGENT
+// 8. DELETE AGENT
 router.delete('/agent/:id', async (req, res) => {
   try {
     await pool.query('DELETE FROM vendor_agents WHERE id = $1', [req.params.id]);
@@ -97,7 +105,7 @@ router.delete('/agent/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 8. GET TRANSACTIONS
+// 9. GET TRANSACTIONS
 router.get('/:id/transactions', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM vendor_transactions WHERE vendor_id = $1 ORDER BY created_at DESC', [req.params.id]);
@@ -105,7 +113,7 @@ router.get('/:id/transactions', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 9. MANUAL LEDGER TRANSACTION (Fixed: Safe Number Handling & Ledger Update)
+// 10. MANUAL LEDGER TRANSACTION
 router.post('/transaction', async (req, res) => {
     const { vendor_id, type, description, metal_weight, cash_amount, conversion_rate } = req.body;
     const client = await pool.connect();
@@ -113,11 +121,9 @@ router.post('/transaction', async (req, res) => {
     try {
       await client.query('BEGIN');
       
-      // Calculate Pure Weight Impact
       let pureImpact = 0;
       let cashConverted = 0;
 
-      // Safe number conversion (Handle empty strings as 0)
       const safeMetal = parseFloat(metal_weight) || 0;
       const safeCash = parseFloat(cash_amount) || 0;
       const safeRate = parseFloat(conversion_rate) || 0;
@@ -125,16 +131,12 @@ router.post('/transaction', async (req, res) => {
       if (type === 'STOCK_ADDED') {
         pureImpact = safeMetal;
       } else if (type === 'REPAYMENT') {
-        // Metal Repayment
         pureImpact = -safeMetal; 
-        // Cash Repayment
         if (safeCash > 0 && safeRate > 0) {
           cashConverted = safeCash / safeRate;
           pureImpact -= cashConverted;
         }
 
-        // --- NEW: UPDATE MASTER LEDGER (Shop Assets) ---
-        // If we are paying cash to vendor, our Cash Balance decreases.
         if (safeCash > 0) {
             await client.query(
                 `UPDATE shop_assets SET cash_balance = cash_balance - $1 WHERE id = 1`,
@@ -143,14 +145,12 @@ router.post('/transaction', async (req, res) => {
         }
       }
 
-      // Update Vendor Balance (Handle null balance safely)
       const vendRes = await client.query('SELECT balance_pure_weight FROM vendors WHERE id = $1 FOR UPDATE', [vendor_id]);
       const currentBal = parseFloat(vendRes.rows[0].balance_pure_weight) || 0;
       const newBal = currentBal + pureImpact;
 
       await client.query('UPDATE vendors SET balance_pure_weight = $1 WHERE id = $2', [newBal, vendor_id]);
 
-      // Log Transaction (Sanitized inputs)
       const totalRepaidPure = type === 'REPAYMENT' ? (safeMetal + cashConverted) : 0;
       
       await client.query(
@@ -173,6 +173,57 @@ router.post('/transaction', async (req, res) => {
       res.status(500).json({ error: err.message });
     } finally {
       client.release();
+    }
+});
+
+// 11. GET VENDOR SPECIFIC INVENTORY
+router.get('/:id/inventory', async (req, res) => {
+  try {
+    const result = await pool.query(
+        `SELECT * FROM inventory_items 
+         WHERE vendor_id = $1 AND (is_deleted IS FALSE OR is_deleted IS NULL)
+         ORDER BY created_at DESC`, 
+         [req.params.id]
+    );
+    const items = result.rows.map(item => ({...item, item_image: item.item_image ? `data:image/jpeg;base64,${item.item_image.toString('base64')}` : null}));
+    res.json(items);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 12. GET VENDOR SALES HISTORY
+router.get('/:id/sales-history', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const query = `
+            SELECT 
+                si.id,
+                si.sale_id,
+                si.item_name,
+                si.sold_weight as gross_weight,
+                si.sold_rate,
+                si.total_item_price,
+                s.created_at,
+                ii.barcode,
+                ii.metal_type,
+                ii.item_image,
+                'SOLD' as status
+            FROM sale_items si
+            JOIN inventory_items ii ON si.item_id = ii.id
+            JOIN sales s ON si.sale_id = s.id
+            WHERE ii.vendor_id = $1
+            ORDER BY s.created_at DESC
+        `;
+        const result = await pool.query(query, [id]);
+        
+        const history = result.rows.map(row => ({
+            ...row,
+            item_image: row.item_image ? `data:image/jpeg;base64,${row.item_image.toString('base64')}` : null
+        }));
+        
+        res.json(history);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
     }
 });
 
