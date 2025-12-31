@@ -52,22 +52,22 @@ router.get('/history', async (req, res) => {
                 
                 UNION ALL
                 
-                -- 2. VENDORS
+                -- 2. VENDORS (Fixed Column Name: cash_amount)
                 SELECT id, 
                        'VENDOR_TXN' as type, 
                        description, 
-                       repaid_cash_amount as cash_amount, 
+                       cash_amount, 
                        -- Strict Metal Separation
                        CASE WHEN metal_type = 'GOLD' THEN (stock_pure_weight + repaid_metal_weight) ELSE 0 END as gold_weight, 
                        CASE WHEN metal_type = 'SILVER' THEN (stock_pure_weight + repaid_metal_weight) ELSE 0 END as silver_weight,
                        
-                       CASE WHEN repaid_cash_amount > 0 THEN 'CASH' ELSE 'STOCK' END as payment_mode, 
+                       CASE WHEN cash_amount > 0 THEN 'CASH' ELSE 'STOCK' END as payment_mode, 
                        created_at as date, 
-                       CASE WHEN repaid_cash_amount > 0 THEN 'OUT' ELSE 'IN' END as direction,
+                       CASE WHEN cash_amount > 0 THEN 'OUT' ELSE 'IN' END as direction,
                        reference_id, 
                        reference_type
                 FROM vendor_transactions 
-                WHERE repaid_cash_amount > 0 OR stock_pure_weight > 0 OR repaid_metal_weight > 0
+                WHERE cash_amount > 0 OR stock_pure_weight > 0 OR repaid_metal_weight > 0
                 
                 UNION ALL
                 
@@ -103,7 +103,7 @@ router.get('/history', async (req, res) => {
 
                 UNION ALL
 
-                -- 5. OLD METAL (Includes Exchanges) - *** FIXED SECTION ***
+                -- 5. OLD METAL (Includes Exchanges)
                 SELECT p.id, 
                        'OLD_METAL' as type, 
                        CONCAT(CASE WHEN p.payment_mode='EXCHANGE' THEN 'Bill Exchange: ' ELSE 'Bought from ' END, p.customer_name, ' (', p.voucher_no, ')'), 
@@ -155,9 +155,8 @@ router.get('/history', async (req, res) => {
                 else dayStats.expense += amt;
             }
 
-            // 2. METAL LOGIC (Corrected for Old Metal)
+            // 2. METAL LOGIC
             if (row.type === 'OLD_METAL') {
-                // Old Metal is special: Money goes OUT (Expense), but Metal comes IN (Stock)
                 dayStats.gold_in += gw;
                 dayStats.silver_in += sw;
             } 
@@ -171,7 +170,6 @@ router.get('/history', async (req, res) => {
                 }
             }
             else {
-                // Standard Logic for other types
                 if(row.direction === 'IN') {
                     dayStats.gold_in += gw;
                     dayStats.silver_in += sw;
@@ -189,7 +187,7 @@ router.get('/history', async (req, res) => {
     }
 });
 
-// ... Keep existing POST routes (expense, adjust) ...
+// 3. ADD EXPENSE
 router.post('/expense', async (req, res) => {
     const { description, amount, category, payment_mode } = req.body;
     const client = await pool.connect();
@@ -208,6 +206,7 @@ router.post('/expense', async (req, res) => {
     }
 });
 
+// 4. MANUAL ADJUSTMENT
 router.post('/adjust', async (req, res) => {
     const { type, amount, mode, note } = req.body; 
     const client = await pool.connect();
