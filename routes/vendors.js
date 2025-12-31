@@ -190,7 +190,7 @@ router.get('/:id/inventory', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 12. GET VENDOR SALES & LENT HISTORY (Combined)
+// 12. GET VENDOR SALES & LENT HISTORY (COMBINED)
 router.get('/:id/sales-history', async (req, res) => {
     try {
         const { id } = req.params;
