@@ -20,10 +20,11 @@ app.use('/api/old-metal', require('./routes/old_metal'));
 app.use('/api/refinery', require('./routes/refinery'));
 app.use('/api/gst', require('./routes/gst_billing'));
 app.use('/api/dashboard', require('./routes/dashboard'));
-
-// --- NEW AUDIT ROUTE ---
 app.use('/api/audit', require('./routes/audit'));
-// -----------------------
+
+// --- NEW CHIT SCHEME ROUTE ---
+app.use('/api/chits', require('./routes/chits'));
+// -----------------------------
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

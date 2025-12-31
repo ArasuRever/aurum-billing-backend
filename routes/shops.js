@@ -53,9 +53,9 @@ router.get('/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. ADD TRANSACTION (Updated with transfer_cash logic)
+// 4. ADD TRANSACTION (Updated with Inventory Deduction)
 router.post('/transaction', async (req, res) => {
-  const { shop_id, action, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, transfer_cash } = req.body;
+  const { shop_id, action, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, transfer_cash, inventory_item_id } = req.body;
   
   const client = await pool.connect();
   try {
@@ -67,18 +67,13 @@ router.post('/transaction', async (req, res) => {
     let c_val = Math.abs(parseFloat(cash_amount) || 0);
 
     // --- A. UPDATE MASTER LEDGER (Shop Assets) ---
-    // Only update Physical Cash if 'transfer_cash' is true (Default: true if undefined, for backward compatibility)
-    // BUT for items with MC, frontend will now send false.
     const shouldUpdateLedger = (transfer_cash !== false); 
 
     if (c_val > 0.01 && shouldUpdateLedger) {
         let assetChange = 0;
-        // Money IN (Increases Cash Balance)
         if (action === 'BORROW_ADD' || action === 'LEND_COLLECT') {
             assetChange = c_val;
-        } 
-        // Money OUT (Decreases Cash Balance)
-        else if (action === 'LEND_ADD' || action === 'BORROW_REPAY') {
+        } else if (action === 'LEND_ADD' || action === 'BORROW_REPAY') {
             assetChange = -c_val;
         }
         
@@ -88,9 +83,7 @@ router.post('/transaction', async (req, res) => {
     }
 
     // --- B. BALANCE UPDATE (Shop Debt Profile) ---
-    // Rule: 'Balance' represents WE OWE THEM (Debt).
     let multiplier = 1;
-    // Actions that represent GIVING (Outgoing): Repaying Debt OR Lending (Adding Credit)
     if (action === 'BORROW_REPAY' || action === 'LEND_ADD') {
         multiplier = -1;
     }
@@ -104,15 +97,24 @@ router.post('/transaction', async (req, res) => {
       [g_val * multiplier, s_val * multiplier, c_val * multiplier, shop_id]
     );
 
-    // --- C. CREATE TRANSACTION RECORD ---
+    // --- C. INVENTORY STATUS UPDATE (New Logic) ---
+    // If we are LENDING an item (Giving it out), mark it as LENT
+    if (action === 'LEND_ADD' && inventory_item_id) {
+        await client.query(
+            "UPDATE inventory_items SET status = 'LENT' WHERE id = $1",
+            [inventory_item_id]
+        );
+    }
+
+    // --- D. CREATE TRANSACTION RECORD ---
     const txnRes = await client.query(
-      `INSERT INTO shop_transactions (shop_id, type, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, is_settled)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE) RETURNING id`,
-      [shop_id, action, description, gross_weight||0, wastage_percent||0, making_charges||0, g_val, s_val, c_val]
+      `INSERT INTO shop_transactions (shop_id, type, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, is_settled, inventory_item_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE, $10) RETURNING id`,
+      [shop_id, action, description, gross_weight||0, wastage_percent||0, making_charges||0, g_val, s_val, c_val, inventory_item_id || null]
     );
     const parentTxnId = txnRes.rows[0].id;
 
-    // --- D. UNIVERSAL FIFO AUTO-ALLOCATION ---
+    // --- E. UNIVERSAL FIFO AUTO-ALLOCATION ---
     let targetType = null;
     if (action === 'BORROW_REPAY' || action === 'LEND_ADD') targetType = 'BORROW_ADD';
     else if (action === 'BORROW_ADD' || action === 'LEND_COLLECT') targetType = 'LEND_ADD';
@@ -184,10 +186,16 @@ router.delete('/transaction/:id', async (req, res) => {
     if (txnRes.rows.length === 0) throw new Error('Transaction not found');
     const txn = txnRes.rows[0];
 
-    // --- A. REVERSE LEDGER IMPACT ---
+    // --- A. REVERSE INVENTORY STATUS (New Logic) ---
+    if (txn.inventory_item_id) {
+        await client.query(
+            "UPDATE inventory_items SET status = 'AVAILABLE' WHERE id = $1",
+            [txn.inventory_item_id]
+        );
+    }
+
+    // --- B. REVERSE LEDGER IMPACT ---
     const c_val = parseFloat(txn.cash_amount) || 0;
-    
-    // Heuristic: If description contains "Item" or "Sold", it was likely MC (Non-Cash).
     const desc = (txn.description || '').toLowerCase();
     const isLikelyMC = desc.includes('item') || desc.includes('sold') || desc.includes('mc');
     
@@ -201,7 +209,7 @@ router.delete('/transaction/:id', async (req, res) => {
         }
     }
 
-    // --- B. REVERSE SHOP DEBT BALANCE ---
+    // --- C. REVERSE SHOP DEBT BALANCE ---
     let g = parseFloat(txn.pure_weight) || 0;
     let s = parseFloat(txn.silver_weight) || 0;
     let c = parseFloat(txn.cash_amount) || 0;
@@ -222,7 +230,7 @@ router.delete('/transaction/:id', async (req, res) => {
       [g * multiplier, s * multiplier, c * multiplier, txn.shop_id]
     );
 
-    // --- C. UN-SETTLE ITEMS ---
+    // --- D. UN-SETTLE ITEMS ---
     const pRes = await client.query(`SELECT transaction_id FROM shop_transaction_payments WHERE parent_txn_id = $1`, [id]);
     if (pRes.rows.length > 0) {
         const ids = pRes.rows.map(r => r.transaction_id);
