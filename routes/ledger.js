@@ -52,22 +52,22 @@ router.get('/history', async (req, res) => {
                 
                 UNION ALL
                 
-                -- 2. VENDORS (Fixed Column Name: cash_amount)
+                -- 2. VENDORS (FIXED: mapped repaid_cash_amount to cash_amount)
                 SELECT id, 
                        'VENDOR_TXN' as type, 
                        description, 
-                       cash_amount, 
+                       repaid_cash_amount as cash_amount, 
                        -- Strict Metal Separation
                        CASE WHEN metal_type = 'GOLD' THEN (stock_pure_weight + repaid_metal_weight) ELSE 0 END as gold_weight, 
                        CASE WHEN metal_type = 'SILVER' THEN (stock_pure_weight + repaid_metal_weight) ELSE 0 END as silver_weight,
                        
-                       CASE WHEN cash_amount > 0 THEN 'CASH' ELSE 'STOCK' END as payment_mode, 
+                       CASE WHEN repaid_cash_amount > 0 THEN 'CASH' ELSE 'STOCK' END as payment_mode, 
                        created_at as date, 
-                       CASE WHEN cash_amount > 0 THEN 'OUT' ELSE 'IN' END as direction,
+                       CASE WHEN repaid_cash_amount > 0 THEN 'OUT' ELSE 'IN' END as direction,
                        reference_id, 
                        reference_type
                 FROM vendor_transactions 
-                WHERE cash_amount > 0 OR stock_pure_weight > 0 OR repaid_metal_weight > 0
+                WHERE repaid_cash_amount > 0 OR stock_pure_weight > 0 OR repaid_metal_weight > 0
                 
                 UNION ALL
                 
@@ -103,14 +103,20 @@ router.get('/history', async (req, res) => {
 
                 UNION ALL
 
-                -- 5. OLD METAL (Includes Exchanges)
+                -- 5. OLD METAL (Includes Exchanges - FIXED: Added Gross/Net Display & Improved Metal Detection)
                 SELECT p.id, 
                        'OLD_METAL' as type, 
-                       CONCAT(CASE WHEN p.payment_mode='EXCHANGE' THEN 'Bill Exchange: ' ELSE 'Bought from ' END, p.customer_name, ' (', p.voucher_no, ')'), 
+                       CONCAT(
+                           CASE WHEN p.payment_mode='EXCHANGE' THEN 'Bill Exchange: ' ELSE 'Bought from ' END, 
+                           p.customer_name, 
+                           ' (', p.voucher_no, ')',
+                           ' [Gr: ', (SELECT COALESCE(SUM(gross_weight), 0) FROM old_metal_items WHERE purchase_id = p.id), 'g, ',
+                           'Net: ', (SELECT COALESCE(SUM(net_weight), 0) FROM old_metal_items WHERE purchase_id = p.id), 'g]'
+                       ) as description, 
                        p.net_payout as cash_amount, 
-                       -- Fetch actual weights from items table
-                       (SELECT COALESCE(SUM(net_weight), 0) FROM old_metal_items WHERE purchase_id = p.id AND metal_type = 'GOLD') as gold_weight, 
-                       (SELECT COALESCE(SUM(net_weight), 0) FROM old_metal_items WHERE purchase_id = p.id AND metal_type = 'SILVER') as silver_weight,
+                       -- Fetch actual weights (Using ILIKE to catch 'Gold 22k', 'Hallmark Gold' etc.)
+                       (SELECT COALESCE(SUM(net_weight), 0) FROM old_metal_items WHERE purchase_id = p.id AND (metal_type ILIKE '%GOLD%' OR metal_type = 'Au')) as gold_weight, 
+                       (SELECT COALESCE(SUM(net_weight), 0) FROM old_metal_items WHERE purchase_id = p.id AND (metal_type ILIKE '%SILVER%' OR metal_type ILIKE '%AG%')) as silver_weight,
                        p.payment_mode, 
                        p.date, 
                        'OUT' as direction,
