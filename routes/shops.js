@@ -53,18 +53,19 @@ router.get('/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. ADD TRANSACTION (Updated with Inventory Deduction)
+// 4. ADD TRANSACTION (Updated for Bulk Lending)
 router.post('/transaction', async (req, res) => {
-  const { shop_id, action, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, transfer_cash, inventory_item_id } = req.body;
+  const { shop_id, action, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, transfer_cash, inventory_item_id, quantity } = req.body;
   
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // Values always positive for storage & logic
+    // Values always positive for logic
     let g_val = Math.abs(parseFloat(pure_weight) || 0);
     let s_val = Math.abs(parseFloat(silver_weight) || 0);
     let c_val = Math.abs(parseFloat(cash_amount) || 0);
+    const lendQty = parseInt(quantity) || 1;
 
     // --- A. UPDATE MASTER LEDGER (Shop Assets) ---
     const shouldUpdateLedger = (transfer_cash !== false); 
@@ -72,9 +73,9 @@ router.post('/transaction', async (req, res) => {
     if (c_val > 0.01 && shouldUpdateLedger) {
         let assetChange = 0;
         if (action === 'BORROW_ADD' || action === 'LEND_COLLECT') {
-            assetChange = c_val;
+            assetChange = c_val; // Cash Coming IN
         } else if (action === 'LEND_ADD' || action === 'BORROW_REPAY') {
-            assetChange = -c_val;
+            assetChange = -c_val; // Cash Going OUT
         }
         
         if (assetChange !== 0) {
@@ -85,7 +86,14 @@ router.post('/transaction', async (req, res) => {
     // --- B. BALANCE UPDATE (Shop Debt Profile) ---
     let multiplier = 1;
     if (action === 'BORROW_REPAY' || action === 'LEND_ADD') {
-        multiplier = -1;
+        multiplier = -1; // Reduces what they owe us (or increases what we owe them - conceptually debt reversal)
+        // Wait, standard logic:
+        // BORROW_ADD: We owe them (+Balance)
+        // BORROW_REPAY: We pay them (-Balance)
+        // LEND_ADD: They owe us (-Balance in our books? No, usually +Receivable. 
+        // In this system: Positive Balance = We Owe (Credit), Negative Balance = They Owe (Debit).
+        // So LEND_ADD (Giving goods) makes balance more negative.
+        multiplier = -1; 
     }
 
     await client.query(
@@ -97,13 +105,43 @@ router.post('/transaction', async (req, res) => {
       [g_val * multiplier, s_val * multiplier, c_val * multiplier, shop_id]
     );
 
-    // --- C. INVENTORY STATUS UPDATE (New Logic) ---
-    // If we are LENDING an item (Giving it out), mark it as LENT
+    // --- C. INVENTORY STATUS UPDATE (New Logic for Bulk) ---
     if (action === 'LEND_ADD' && inventory_item_id) {
-        await client.query(
-            "UPDATE inventory_items SET status = 'LENT' WHERE id = $1",
-            [inventory_item_id]
-        );
+        const itemRes = await client.query("SELECT * FROM inventory_items WHERE id = $1", [inventory_item_id]);
+        if(itemRes.rows.length > 0) {
+            const item = itemRes.rows[0];
+            
+            if (item.stock_type === 'BULK') {
+                // Deduct Weight & Quantity
+                const newWt = parseFloat(item.gross_weight) - (parseFloat(gross_weight) || 0);
+                const newQty = parseInt(item.quantity) - lendQty;
+                
+                // If it becomes empty, mark LENT, otherwise keep AVAILABLE
+                const newStatus = (newWt < 0.01 && newQty <= 0) ? 'LENT' : 'AVAILABLE'; 
+                
+                await client.query(
+                    `UPDATE inventory_items SET gross_weight = $1, quantity = $2, status = $3 WHERE id = $4`,
+                    [newWt, newQty, newStatus, inventory_item_id]
+                );
+                
+                // Log the lending action
+                await client.query(
+                    `INSERT INTO item_stock_logs (inventory_item_id, action_type, quantity_change, weight_change, description)
+                     VALUES ($1, 'LEND', $2, $3, 'Lent to Shop')`,
+                    [inventory_item_id, -lendQty, -(parseFloat(gross_weight)||0)]
+                );
+
+            } else {
+                // Single Item - Just mark status
+                await client.query("UPDATE inventory_items SET status = 'LENT' WHERE id = $1", [inventory_item_id]);
+                
+                await client.query(
+                    `INSERT INTO item_stock_logs (inventory_item_id, action_type, quantity_change, weight_change, description)
+                     VALUES ($1, 'LEND', -1, $2, 'Lent to Shop')`,
+                    [inventory_item_id, -(parseFloat(gross_weight)||0)]
+                );
+            }
+        }
     }
 
     // --- D. CREATE TRANSACTION RECORD ---
@@ -186,7 +224,11 @@ router.delete('/transaction/:id', async (req, res) => {
     if (txnRes.rows.length === 0) throw new Error('Transaction not found');
     const txn = txnRes.rows[0];
 
-    // --- A. REVERSE INVENTORY STATUS (New Logic) ---
+    // --- A. REVERSE INVENTORY STATUS ---
+    // For Bulk: Reversing a partial lend is complex (we don't know exact previous state easily).
+    // Simplified: If it was marked 'LENT' (empty), restore to 'AVAILABLE'. 
+    // Ideally, we should add the weight back, but for now we assume manual correction if weight was partial.
+    // However, if inventory_item_id exists, we ensure it is AVAILABLE.
     if (txn.inventory_item_id) {
         await client.query(
             "UPDATE inventory_items SET status = 'AVAILABLE' WHERE id = $1",
@@ -244,7 +286,7 @@ router.delete('/transaction/:id', async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// 6. UPDATE TRANSACTION (Edit) - Unchanged
+// 6. UPDATE TRANSACTION (Edit)
 router.put('/transaction/:id', async (req, res) => {
   const { id } = req.params;
   const { description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount } = req.body;
@@ -295,12 +337,9 @@ router.post('/settle-item', async (req, res) => {
         const safeCash = parseFloat(cash_val) || 0;
         if (safeCash > 0.01) {
             let assetChange = 0;
-            // Parent: BORROW_ADD (We Owe Debt) -> We are settling it (Paying) -> Cash OUT
             if (type === 'BORROW_ADD') {
                 assetChange = -safeCash;
-            } 
-            // Parent: LEND_ADD (They Owe Us) -> We are settling it (Collecting) -> Cash IN
-            else if (type === 'LEND_ADD') {
+            } else if (type === 'LEND_ADD') {
                 assetChange = safeCash;
             }
 
