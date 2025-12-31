@@ -84,16 +84,10 @@ router.post('/transaction', async (req, res) => {
     }
 
     // --- B. BALANCE UPDATE (Shop Debt Profile) ---
+    // Logic: BORROW_ADD (Credit, +ve), BORROW_REPAY (Debit, -ve), LEND_ADD (Debit, -ve)
     let multiplier = 1;
     if (action === 'BORROW_REPAY' || action === 'LEND_ADD') {
-        multiplier = -1; // Reduces what they owe us (or increases what we owe them - conceptually debt reversal)
-        // Wait, standard logic:
-        // BORROW_ADD: We owe them (+Balance)
-        // BORROW_REPAY: We pay them (-Balance)
-        // LEND_ADD: They owe us (-Balance in our books? No, usually +Receivable. 
-        // In this system: Positive Balance = We Owe (Credit), Negative Balance = They Owe (Debit).
-        // So LEND_ADD (Giving goods) makes balance more negative.
-        multiplier = -1; 
+        multiplier = -1; // Reduces what they owe us (or increases our credit to them)
     }
 
     await client.query(
@@ -110,14 +104,15 @@ router.post('/transaction', async (req, res) => {
         const itemRes = await client.query("SELECT * FROM inventory_items WHERE id = $1", [inventory_item_id]);
         if(itemRes.rows.length > 0) {
             const item = itemRes.rows[0];
-            
+            const lentWt = parseFloat(gross_weight) || 0;
+
             if (item.stock_type === 'BULK') {
                 // Deduct Weight & Quantity
-                const newWt = parseFloat(item.gross_weight) - (parseFloat(gross_weight) || 0);
-                const newQty = parseInt(item.quantity) - lendQty;
+                const newWt = parseFloat(item.gross_weight) - lentWt;
+                const newQty = Math.max(0, parseInt(item.quantity) - lendQty);
                 
                 // If it becomes empty, mark LENT, otherwise keep AVAILABLE
-                const newStatus = (newWt < 0.01 && newQty <= 0) ? 'LENT' : 'AVAILABLE'; 
+                const newStatus = (newWt < 0.01 && newQty === 0) ? 'LENT' : 'AVAILABLE'; 
                 
                 await client.query(
                     `UPDATE inventory_items SET gross_weight = $1, quantity = $2, status = $3 WHERE id = $4`,
@@ -128,7 +123,7 @@ router.post('/transaction', async (req, res) => {
                 await client.query(
                     `INSERT INTO item_stock_logs (inventory_item_id, action_type, quantity_change, weight_change, description)
                      VALUES ($1, 'LEND', $2, $3, 'Lent to Shop')`,
-                    [inventory_item_id, -lendQty, -(parseFloat(gross_weight)||0)]
+                    [inventory_item_id, -lendQty, -lentWt]
                 );
 
             } else {
@@ -146,9 +141,9 @@ router.post('/transaction', async (req, res) => {
 
     // --- D. CREATE TRANSACTION RECORD ---
     const txnRes = await client.query(
-      `INSERT INTO shop_transactions (shop_id, type, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, is_settled, inventory_item_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE, $10) RETURNING id`,
-      [shop_id, action, description, gross_weight||0, wastage_percent||0, making_charges||0, g_val, s_val, c_val, inventory_item_id || null]
+      `INSERT INTO shop_transactions (shop_id, type, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, is_settled, inventory_item_id, quantity)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE, $10, $11) RETURNING id`,
+      [shop_id, action, description, gross_weight||0, wastage_percent||0, making_charges||0, g_val, s_val, c_val, inventory_item_id || null, lendQty]
     );
     const parentTxnId = txnRes.rows[0].id;
 
@@ -225,15 +220,34 @@ router.delete('/transaction/:id', async (req, res) => {
     const txn = txnRes.rows[0];
 
     // --- A. REVERSE INVENTORY STATUS ---
-    // For Bulk: Reversing a partial lend is complex (we don't know exact previous state easily).
-    // Simplified: If it was marked 'LENT' (empty), restore to 'AVAILABLE'. 
-    // Ideally, we should add the weight back, but for now we assume manual correction if weight was partial.
-    // However, if inventory_item_id exists, we ensure it is AVAILABLE.
-    if (txn.inventory_item_id) {
-        await client.query(
-            "UPDATE inventory_items SET status = 'AVAILABLE' WHERE id = $1",
-            [txn.inventory_item_id]
-        );
+    if (txn.inventory_item_id && txn.type === 'LEND_ADD') {
+        const itemRes = await client.query("SELECT * FROM inventory_items WHERE id = $1", [txn.inventory_item_id]);
+        if (itemRes.rows.length > 0) {
+            const item = itemRes.rows[0];
+            const restoreWt = parseFloat(txn.gross_weight) || 0;
+            const restoreQty = parseInt(txn.quantity) || 1;
+
+            if (item.stock_type === 'BULK') {
+                await client.query(
+                    `UPDATE inventory_items 
+                     SET gross_weight = gross_weight + $1, quantity = quantity + $2, status = 'AVAILABLE' 
+                     WHERE id = $3`,
+                    [restoreWt, restoreQty, txn.inventory_item_id]
+                );
+            } else {
+                await client.query(
+                    "UPDATE inventory_items SET status = 'AVAILABLE' WHERE id = $1",
+                    [txn.inventory_item_id]
+                );
+            }
+            
+            // Log Restoration
+            await client.query(
+                `INSERT INTO item_stock_logs (inventory_item_id, action_type, quantity_change, weight_change, description)
+                 VALUES ($1, 'RETURN', $2, $3, 'Lend Reverted')`,
+                [txn.inventory_item_id, restoreQty, restoreWt]
+            );
+        }
     }
 
     // --- B. REVERSE LEDGER IMPACT ---

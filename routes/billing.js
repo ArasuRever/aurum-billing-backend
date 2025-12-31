@@ -77,9 +77,11 @@ router.post('/create-bill', async (req, res) => {
 
     // B. Process Sale Items
     for (const item of items) {
+      const qty = parseInt(item.quantity) || 1; // Get Qty from frontend
+
       await client.query(
-        `INSERT INTO sale_items (sale_id, item_id, item_name, sold_weight, sold_rate, making_charges_collected, total_item_price) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [saleId, item.item_id || null, item.item_name, item.gross_weight, item.rate, item.making_charges || 0, item.total]
+        `INSERT INTO sale_items (sale_id, item_id, item_name, sold_weight, sold_rate, making_charges_collected, total_item_price, quantity) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [saleId, item.item_id || null, item.item_name, item.gross_weight, item.rate, item.making_charges || 0, item.total, qty]
       );
 
       // Handle Inventory & Neighbor Debt
@@ -94,7 +96,6 @@ router.post('/create-bill', async (req, res) => {
         if (checkRes.rows.length > 0) {
             const dbItem = checkRes.rows[0];
             const soldWt = parseFloat(item.gross_weight) || 0;
-            const soldQty = parseInt(item.quantity) || 1; // From frontend
             metalType = dbItem.metal_type;
 
             if (dbItem.stock_type === 'BULK') {
@@ -102,7 +103,7 @@ router.post('/create-bill', async (req, res) => {
                 const currentQty = parseInt(dbItem.quantity) || 0;
                 
                 const newWt = currentWt - soldWt;
-                const newQty = Math.max(0, currentQty - soldQty); // Deduct Qty
+                const newQty = Math.max(0, currentQty - qty); // Deduct Qty
                 
                 const newPure = newWt * (parseFloat(dbItem.wastage_percent)/100);
                 const newStatus = (newWt < 0.01 && newQty === 0) ? 'SOLD' : 'AVAILABLE';
@@ -118,10 +119,10 @@ router.post('/create-bill', async (req, res) => {
                 await client.query(
                     `INSERT INTO item_stock_logs (inventory_item_id, action_type, quantity_change, weight_change, related_bill_no, description)
                      VALUES ($1, 'SALE', $2, $3, $4, 'Item Sold')`,
-                    [item.item_id, -soldQty, -soldWt, invoiceNumber]
+                    [item.item_id, -qty, -soldWt, invoiceNumber]
                 );
 
-                description = `Bulk Sold: ${item.item_name} (${soldWt}g, Qty:${soldQty})`;
+                description = `Bulk Sold: ${item.item_name} (${soldWt}g, Qty:${qty})`;
             } else {
                 // SINGLE Item
                 await client.query(`UPDATE inventory_items SET status = 'SOLD' WHERE id = $1`, [item.item_id]);
@@ -194,7 +195,6 @@ router.post('/create-bill', async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ success: false, error: err.message }); } finally { client.release(); }
 });
 
-// ... (Other routes remain unchanged) ...
 // 4. ADD BALANCE PAYMENT
 router.post('/add-payment', async (req, res) => {
     const { sale_id, amount, payment_mode, note } = req.body;
@@ -273,24 +273,21 @@ router.delete('/delete/:id', async (req, res) => {
 
               if (invItem.stock_type === 'BULK') {
                   const soldWt = parseFloat(saleItem.sold_weight);
+                  const soldQty = parseInt(saleItem.quantity) || 1; // Default to 1 if not stored
                   const purity = parseFloat(invItem.wastage_percent);
                   const pureWt = soldWt * (purity / 100);
-                  // We also need to restore Qty somehow. 
-                  // Assuming sales of bulk always reduce qty by at least 1, we restore 1 if we don't have sold_qty in sale_items (which we didn't store before).
-                  // For now, simple restore of weight. Ideally, update sale_items to store qty too.
-                  // Since we didn't add sold_qty column to sale_items in this update (to avoid complex migration), we assume weight restoration is key.
                   
                   await client.query(
                       `UPDATE inventory_items 
-                       SET gross_weight = gross_weight + $1, pure_weight = pure_weight + $2, status = 'AVAILABLE', source_type = $3, neighbour_shop_id = $4 WHERE id = $5`,
-                      [soldWt, pureWt, newSource, newNeighbourId, invItem.id]
+                       SET gross_weight = gross_weight + $1, pure_weight = pure_weight + $2, quantity = quantity + $3, status = 'AVAILABLE', source_type = $4, neighbour_shop_id = $5 WHERE id = $6`,
+                      [soldWt, pureWt, soldQty, newSource, newNeighbourId, invItem.id]
                   );
                   
                   // Log Undo
                   await client.query(
                     `INSERT INTO item_stock_logs (inventory_item_id, action_type, quantity_change, weight_change, description)
-                     VALUES ($1, 'RETURN', 0, $2, 'Bill Voided')`,
-                    [invItem.id, soldWt]
+                     VALUES ($1, 'RETURN', $2, $3, 'Bill Voided')`,
+                    [invItem.id, soldQty, soldWt]
                   );
 
               } else {

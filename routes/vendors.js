@@ -33,7 +33,7 @@ router.get('/search', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. GET ALL VENDORS (WAS MISSING)
+// 3. GET ALL VENDORS
 router.get('/list', async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM vendors ORDER BY id DESC");
@@ -190,7 +190,7 @@ router.get('/:id/inventory', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 12. GET VENDOR SALES HISTORY
+// 12. GET VENDOR SALES & LENT HISTORY (Combined)
 router.get('/:id/sales-history', async (req, res) => {
     try {
         const { id } = req.params;
@@ -200,6 +200,7 @@ router.get('/:id/sales-history', async (req, res) => {
                 si.sale_id,
                 si.item_name,
                 si.sold_weight as gross_weight,
+                si.quantity,
                 si.sold_rate,
                 si.total_item_price,
                 s.created_at,
@@ -211,7 +212,27 @@ router.get('/:id/sales-history', async (req, res) => {
             JOIN inventory_items ii ON si.item_id = ii.id
             JOIN sales s ON si.sale_id = s.id
             WHERE ii.vendor_id = $1
-            ORDER BY s.created_at DESC
+            
+            UNION ALL
+            
+            SELECT 
+                st.id,
+                st.shop_id as sale_id,
+                st.description as item_name,
+                st.gross_weight,
+                st.quantity,
+                0 as sold_rate,
+                0 as total_item_price,
+                st.created_at,
+                ii.barcode,
+                ii.metal_type,
+                ii.item_image,
+                'LENT' as status
+            FROM shop_transactions st
+            JOIN inventory_items ii ON st.inventory_item_id = ii.id
+            WHERE ii.vendor_id = $1 AND st.type = 'LEND_ADD'
+            
+            ORDER BY created_at DESC
         `;
         const result = await pool.query(query, [id]);
         
