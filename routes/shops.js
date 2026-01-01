@@ -1,4 +1,3 @@
-// ... (Imports and Routes 1-3 remain same) ...
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
@@ -24,14 +23,15 @@ router.get('/list', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. GET SHOP DETAILS
+// 3. GET SHOP DETAILS (ENHANCED FOR HISTORY & PENDING CALC)
 router.get('/:id', async (req, res) => {
   try {
-    const shopRes = await pool.query('SELECT * FROM external_shops WHERE id = $1', [req.params.id]);
-    const transRes = await pool.query('SELECT * FROM shop_transactions WHERE shop_id = $1 ORDER BY created_at DESC', [req.params.id]);
+    const shopId = req.params.id;
+    const shopRes = await pool.query('SELECT * FROM external_shops WHERE id = $1', [shopId]);
+    const transRes = await pool.query('SELECT * FROM shop_transactions WHERE shop_id = $1 ORDER BY created_at DESC', [shopId]);
     
-    // Fetch aggregated payments per item
-    const paymentRes = await pool.query(`
+    // 1. Fetch aggregated payments per item (For Top Tables - Pending Calc)
+    const paymentAggRes = await pool.query(`
         SELECT transaction_id, 
                SUM(COALESCE(gold_paid, 0) + COALESCE(converted_metal_weight, 0)) as total_gold_paid,
                SUM(COALESCE(silver_paid, 0)) as total_silver_paid,
@@ -41,8 +41,9 @@ router.get('/:id', async (req, res) => {
     `);
 
     const paymentsMap = {};
-    paymentRes.rows.forEach(p => { paymentsMap[p.transaction_id] = p; });
+    paymentAggRes.rows.forEach(p => { paymentsMap[p.transaction_id] = p; });
 
+    // Attach payments to transactions for the "Pending" calculation in top tables
     const transactions = transRes.rows.map(t => ({
         ...t,
         total_gold_paid: parseFloat(paymentsMap[t.id]?.total_gold_paid || 0),
@@ -50,14 +51,49 @@ router.get('/:id', async (req, res) => {
         total_cash_paid: parseFloat(paymentsMap[t.id]?.total_cash_paid || 0)
     }));
 
-    res.json({ shop: shopRes.rows[0], transactions: transactions });
+    // 2. Fetch Detailed Payment History (For Bottom Table - Unified History)
+    const historyRes = await pool.query(`
+        SELECT 
+            p.id, p.created_at, p.payment_mode, 
+            p.gold_paid, p.silver_paid, p.cash_paid,
+            t.description as item_desc, t.id as parent_id,
+            'SETTLEMENT' as type
+        FROM shop_transaction_payments p
+        JOIN shop_transactions t ON p.transaction_id = t.id
+        WHERE t.shop_id = $1
+        ORDER BY p.created_at DESC
+    `, [shopId]);
+
+    // Combine standard transactions and payment records into one timeline
+    const fullHistory = [
+        ...transactions.map(t => ({ ...t, kind: 'TXN' })), 
+        ...historyRes.rows.map(p => ({
+            id: `PAY-${p.id}`, // Unique ID for key
+            created_at: p.created_at,
+            type: 'SETTLEMENT', // Visual Tag
+            description: `Paid for: ${p.item_desc} (Ref #${p.parent_id})`,
+            pure_weight: p.gold_paid,
+            silver_weight: p.silver_paid,
+            cash_amount: p.cash_paid,
+            kind: 'PAY'
+        }))
+    ];
+
+    // Sort combined history by date DESC
+    fullHistory.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+    res.json({ 
+        shop: shopRes.rows[0], 
+        transactions: transactions, // For Top Tables (Borrow/Lend)
+        full_history: fullHistory   // For Bottom Table (Audit Trail)
+    });
+
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. ADD TRANSACTION (UPDATED METAL CHECK)
+// 4. ADD TRANSACTION
 router.post('/transaction', async (req, res) => {
   const { shop_id, action, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, transfer_cash, inventory_item_id, quantity } = req.body;
-  
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -85,7 +121,7 @@ router.post('/transaction', async (req, res) => {
         }
     }
 
-    // ... (Ledger and Balance Updates remain same) ...
+    // ... (Ledger and Balance Updates) ...
     const shouldUpdateLedger = (transfer_cash !== false); 
     if (c_val > 0.01 && shouldUpdateLedger) {
         let assetChange = 0;
@@ -106,7 +142,7 @@ router.post('/transaction', async (req, res) => {
       [inputG * multiplier, inputS * multiplier, c_val * multiplier, shop_id]
     );
 
-    // ... (Inventory Status Update remains same) ...
+    // ... (Inventory Status Update) ...
     if (action === 'LEND_ADD' && inventory_item_id) {
         const itemRes = await client.query("SELECT * FROM inventory_items WHERE id = $1", [inventory_item_id]);
         if(itemRes.rows.length > 0) {
@@ -126,7 +162,7 @@ router.post('/transaction', async (req, res) => {
         }
     }
 
-    // ... (Transaction Insert remains same) ...
+    // ... (Transaction Insert) ...
     const txnRes = await client.query(
       `INSERT INTO shop_transactions (shop_id, type, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, is_settled, inventory_item_id, quantity)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE, $10, $11) RETURNING id`,
@@ -134,7 +170,7 @@ router.post('/transaction', async (req, res) => {
     );
     const parentTxnId = txnRes.rows[0].id;
 
-    // ... (FIFO Allocation Logic remains same) ...
+    // ... (FIFO Allocation Logic) ...
     let targetType = null;
     if (action === 'BORROW_REPAY' || action === 'LEND_ADD') targetType = 'BORROW_ADD';
     else if (action === 'BORROW_ADD' || action === 'LEND_COLLECT') targetType = 'LEND_ADD';
@@ -200,7 +236,6 @@ router.post('/transaction', async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// ... (Delete/Update/Settle logic remains same as previous turns) ...
 // 5. DELETE TRANSACTION
 router.delete('/transaction/:id', async (req, res) => {
   const { id } = req.params;
@@ -324,34 +359,34 @@ router.post('/settle-item', async (req, res) => {
     try {
         await client.query('BEGIN');
         
+        // 1. Record Payment
         await client.query(
             `INSERT INTO shop_transaction_payments (transaction_id, payment_mode, gold_paid, silver_paid, cash_paid, metal_rate, converted_metal_weight) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
             [transaction_id, payment_mode, gold_val||0, silver_val||0, cash_val||0, metal_rate||0, converted_weight||0]
         );
         
+        // 2. Adjust Assets & Shop Balance
         const tRes = await client.query('SELECT type FROM shop_transactions WHERE id=$1', [transaction_id]);
         const type = tRes.rows[0].type;
-        
         const safeCash = parseFloat(cash_val) || 0;
+        
         if (safeCash > 0.01) {
             let assetChange = 0;
-            if (type === 'BORROW_ADD') assetChange = -safeCash;
-            else if (type === 'LEND_ADD') assetChange = safeCash;
-
-            if (assetChange !== 0) {
-                await client.query(`UPDATE shop_assets SET cash_balance = cash_balance + $1 WHERE id = 1`, [assetChange]);
-            }
+            if (type === 'BORROW_ADD') assetChange = -safeCash; // We paid cash out
+            else if (type === 'LEND_ADD') assetChange = safeCash; // We collected cash
+            if (assetChange !== 0) await client.query(`UPDATE shop_assets SET cash_balance = cash_balance + $1 WHERE id = 1`, [assetChange]);
         }
 
         let g = (parseFloat(gold_val)||0) + (parseFloat(converted_weight)||0);
         let s = parseFloat(silver_val)||0;
         let c = parseFloat(cash_val)||0;
 
-        let mult = (type === 'BORROW_ADD') ? -1 : 1;
+        let mult = (type === 'BORROW_ADD') ? -1 : 1; // Reduce debt or credit
 
         await client.query(`UPDATE external_shops SET balance_gold=balance_gold+$1, balance_silver=balance_silver+$2, balance_cash=balance_cash+$3 WHERE id=$4`, 
             [g*mult, s*mult, c*mult, shop_id]);
         
+        // 3. Check for Full Settlement
         const sumRes = await client.query(`
             SELECT t.pure_weight, t.silver_weight, t.cash_amount,
                    SUM(COALESCE(p.gold_paid,0) + COALESCE(p.converted_metal_weight,0)) as paid_gold,
