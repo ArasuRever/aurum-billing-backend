@@ -17,34 +17,41 @@ router.get('/pending-scrap', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. CREATE BATCH (Added Net Weight handling)
+// 2. CREATE BATCH (Fixed Logic)
 router.post('/create-batch', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const { metal_type, item_ids, manual_weight, net_weight } = req.body; 
+        
+        // Robust input handling: accept either key
+        const { metal_type, manual_weight, net_weight } = req.body;
+        const item_ids = req.body.item_ids || req.body.selected_item_ids || [];
 
         let listGross = 0;
         
-        if (item_ids && item_ids.length > 0) {
-            const itemsRes = await client.query("SELECT id, gross_weight FROM old_metal_items WHERE id = ANY($1::int[])", [item_ids]);
-            listGross = itemsRes.rows.reduce((sum, item) => sum + parseFloat(item.gross_weight), 0);
-            
-            // Mark items as BATCHED (batch_id updated later)
-            await client.query(`UPDATE old_metal_items SET status = 'BATCHED', batch_id = 0 WHERE id = ANY($1::int[])`, [item_ids]);
+        // 1. Calculate Weight from Selected Items
+        if (item_ids.length > 0) {
+            const itemsRes = await client.query(
+                "SELECT id, gross_weight FROM old_metal_items WHERE id = ANY($1::int[])", 
+                [item_ids]
+            );
+            listGross = itemsRes.rows.reduce((sum, item) => sum + parseFloat(item.gross_weight || 0), 0);
         }
 
         const manual = parseFloat(manual_weight) || 0;
         const totalGross = listGross + manual;
-        const totalNet = parseFloat(net_weight) || 0; // Editable Net Weight from UI
+        const totalNet = parseFloat(net_weight) || 0; 
 
-        if (totalGross <= 0) throw new Error("Batch weight cannot be zero.");
+        if (totalGross <= 0) {
+            throw new Error("Batch weight cannot be zero. Select items or enter manual weight.");
+        }
 
+        // 2. Generate Batch Number
         const batchCountRes = await client.query("SELECT COUNT(*) FROM refinery_batches");
         const count = parseInt(batchCountRes.rows[0].count) + 1;
         const batchNo = `RB-${metal_type.charAt(0)}-${String(count).padStart(4, '0')}`;
 
-        // Insert Batch with Pure Weight (Net Weight) estimate
+        // 3. Create Batch Record
         const batchRes = await client.query(`
             INSERT INTO refinery_batches (batch_no, metal_type, gross_weight, pure_weight, status, sent_date)
             VALUES ($1, $2, $3, $4, 'SENT', NOW()) RETURNING id`,
@@ -52,14 +59,25 @@ router.post('/create-batch', async (req, res) => {
         );
         const batchId = batchRes.rows[0].id;
 
-        // Link items
-        if (item_ids && item_ids.length > 0) {
-            await client.query(`UPDATE old_metal_items SET batch_id = $1 WHERE id = ANY($2::int[])`, [batchId, item_ids]);
+        // 4. Link Items & Update Status (Single Query is safer)
+        if (item_ids.length > 0) {
+            await client.query(
+                `UPDATE old_metal_items 
+                 SET batch_id = $1, status = 'BATCHED' 
+                 WHERE id = ANY($2::int[])`, 
+                [batchId, item_ids]
+            );
         }
 
         await client.query('COMMIT');
         res.json({ success: true, batch_no: batchNo });
-    } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
+    } catch (err) { 
+        await client.query('ROLLBACK'); 
+        console.error("Refinery Batch Error:", err);
+        res.status(500).json({ error: err.message }); 
+    } finally { 
+        client.release(); 
+    }
 });
 
 // 3. GET BATCHES
@@ -88,8 +106,8 @@ router.post('/receive-refined', async (req, res) => {
         const tch = parseFloat(touch);
         const pure_weight = (refined * (tch / 100)).toFixed(3);
 
-        if (parseFloat(pure_weight) > sentWeight + 0.5) { 
-             return res.status(400).json({ error: `Security Warning: Pure weight (${pure_weight}g) exceeds Sent Weight (${sentWeight}g)!` });
+        if (parseFloat(pure_weight) > sentWeight + 2.0) { // Allowed 2g buffer for manual adds
+             return res.status(400).json({ error: `Security Warning: Pure weight (${pure_weight}g) is significantly higher than Sent Weight!` });
         }
 
         await pool.query(`
