@@ -7,9 +7,12 @@ router.get('/stats', async (req, res) => {
     try {
         const goldStats = await pool.query(`
             SELECT 
-                COALESCE(SUM(CASE WHEN p.payment_mode != 'EXCHANGE' THEN i.net_weight ELSE 0 END), 0) as purchase_weight,
-                COALESCE(SUM(CASE WHEN p.payment_mode = 'EXCHANGE' THEN i.net_weight ELSE 0 END), 0) as exchange_weight,
-                COALESCE(SUM(i.net_weight), 0) as total_weight,
+                COALESCE(SUM(CASE WHEN p.payment_mode != 'EXCHANGE' THEN i.gross_weight ELSE 0 END), 0) as purchase_gross,
+                COALESCE(SUM(CASE WHEN p.payment_mode != 'EXCHANGE' THEN i.net_weight ELSE 0 END), 0) as purchase_net,
+                COALESCE(SUM(CASE WHEN p.payment_mode = 'EXCHANGE' THEN i.gross_weight ELSE 0 END), 0) as exchange_gross,
+                COALESCE(SUM(CASE WHEN p.payment_mode = 'EXCHANGE' THEN i.net_weight ELSE 0 END), 0) as exchange_net,
+                COALESCE(SUM(i.gross_weight), 0) as total_gross,
+                COALESCE(SUM(i.net_weight), 0) as total_net,
                 COALESCE(SUM(CASE WHEN p.payment_mode != 'EXCHANGE' THEN i.amount ELSE 0 END), 0) as cost
             FROM old_metal_items i
             JOIN old_metal_purchases p ON i.purchase_id = p.id
@@ -18,9 +21,12 @@ router.get('/stats', async (req, res) => {
 
         const silverStats = await pool.query(`
             SELECT 
-                COALESCE(SUM(CASE WHEN p.payment_mode != 'EXCHANGE' THEN i.net_weight ELSE 0 END), 0) as purchase_weight,
-                COALESCE(SUM(CASE WHEN p.payment_mode = 'EXCHANGE' THEN i.net_weight ELSE 0 END), 0) as exchange_weight,
-                COALESCE(SUM(i.net_weight), 0) as total_weight,
+                COALESCE(SUM(CASE WHEN p.payment_mode != 'EXCHANGE' THEN i.gross_weight ELSE 0 END), 0) as purchase_gross,
+                COALESCE(SUM(CASE WHEN p.payment_mode != 'EXCHANGE' THEN i.net_weight ELSE 0 END), 0) as purchase_net,
+                COALESCE(SUM(CASE WHEN p.payment_mode = 'EXCHANGE' THEN i.gross_weight ELSE 0 END), 0) as exchange_gross,
+                COALESCE(SUM(CASE WHEN p.payment_mode = 'EXCHANGE' THEN i.net_weight ELSE 0 END), 0) as exchange_net,
+                COALESCE(SUM(i.gross_weight), 0) as total_gross,
+                COALESCE(SUM(i.net_weight), 0) as total_net,
                 COALESCE(SUM(CASE WHEN p.payment_mode != 'EXCHANGE' THEN i.amount ELSE 0 END), 0) as cost
             FROM old_metal_items i
             JOIN old_metal_purchases p ON i.purchase_id = p.id
@@ -32,15 +38,21 @@ router.get('/stats', async (req, res) => {
 
         res.json({
             // Gold
-            gold_purchase_weight: parseFloat(g.purchase_weight),
-            gold_exchange_weight: parseFloat(g.exchange_weight),
-            gold_total_weight: parseFloat(g.total_weight),
+            gold_purchase_gross: parseFloat(g.purchase_gross),
+            gold_purchase_net: parseFloat(g.purchase_net),
+            gold_exchange_gross: parseFloat(g.exchange_gross),
+            gold_exchange_net: parseFloat(g.exchange_net),
+            gold_total_gross: parseFloat(g.total_gross),
+            gold_total_net: parseFloat(g.total_net),
             gold_cost: parseFloat(g.cost),
             
             // Silver
-            silver_purchase_weight: parseFloat(s.purchase_weight),
-            silver_exchange_weight: parseFloat(s.exchange_weight),
-            silver_total_weight: parseFloat(s.total_weight),
+            silver_purchase_gross: parseFloat(s.purchase_gross),
+            silver_purchase_net: parseFloat(s.purchase_net),
+            silver_exchange_gross: parseFloat(s.exchange_gross),
+            silver_exchange_net: parseFloat(s.exchange_net),
+            silver_total_gross: parseFloat(s.total_gross),
+            silver_total_net: parseFloat(s.total_net),
             silver_cost: parseFloat(s.cost)
         });
     } catch (err) {
@@ -49,6 +61,7 @@ router.get('/stats', async (req, res) => {
     }
 });
 
+// ... (Rest of the file remains unchanged: list, purchase, delete) ...
 // 2. GET LIST (HISTORY)
 router.get('/list', async (req, res) => {
     try {
