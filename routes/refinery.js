@@ -17,14 +17,14 @@ router.get('/pending-scrap', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. CREATE BATCH (Fixed Logic)
+// 2. CREATE BATCH (Updated for Manual Naming)
 router.post('/create-batch', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
         
-        // Robust input handling: accept either key
-        const { metal_type, manual_weight, net_weight } = req.body;
+        // Accepted inputs: manual_weight, metal_type, and optional batch_name
+        const { metal_type, manual_weight, net_weight, batch_name } = req.body;
         const item_ids = req.body.item_ids || req.body.selected_item_ids || [];
 
         let listGross = 0;
@@ -46,10 +46,15 @@ router.post('/create-batch', async (req, res) => {
             throw new Error("Batch weight cannot be zero. Select items or enter manual weight.");
         }
 
-        // 2. Generate Batch Number
-        const batchCountRes = await client.query("SELECT COUNT(*) FROM refinery_batches");
-        const count = parseInt(batchCountRes.rows[0].count) + 1;
-        const batchNo = `RB-${metal_type.charAt(0)}-${String(count).padStart(4, '0')}`;
+        // 2. Determine Batch Name (Manual OR Auto-Generated)
+        let batchNo = batch_name; // Use user input if provided
+
+        if (!batchNo || batchNo.trim() === '') {
+            // Auto-generate if empty
+            const batchCountRes = await client.query("SELECT COUNT(*) FROM refinery_batches");
+            const count = parseInt(batchCountRes.rows[0].count) + 1;
+            batchNo = `RB-${metal_type.charAt(0)}-${String(count).padStart(4, '0')}`;
+        }
 
         // 3. Create Batch Record
         const batchRes = await client.query(`
@@ -59,7 +64,7 @@ router.post('/create-batch', async (req, res) => {
         );
         const batchId = batchRes.rows[0].id;
 
-        // 4. Link Items & Update Status (Single Query is safer)
+        // 4. Link Items & Update Status
         if (item_ids.length > 0) {
             await client.query(
                 `UPDATE old_metal_items 
@@ -94,9 +99,15 @@ router.get('/batches', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. RECEIVE REFINED
+// 4. RECEIVE REFINED (Fixed Crash Issue)
 router.post('/receive-refined', async (req, res) => {
+    // Safety Check: If body is missing/undefined
+    if (!req.body || !req.body.batch_id) {
+        return res.status(400).json({ error: "Invalid Data: Batch ID is missing. Check your connection or payload." });
+    }
+
     const { batch_id, refined_weight, touch } = req.body; 
+    
     try {
         const batchRes = await pool.query("SELECT gross_weight FROM refinery_batches WHERE id = $1", [batch_id]);
         if (batchRes.rows.length === 0) return res.status(404).json({ error: "Batch not found" });
@@ -106,7 +117,7 @@ router.post('/receive-refined', async (req, res) => {
         const tch = parseFloat(touch);
         const pure_weight = (refined * (tch / 100)).toFixed(3);
 
-        if (parseFloat(pure_weight) > sentWeight + 2.0) { // Allowed 2g buffer for manual adds
+        if (parseFloat(pure_weight) > sentWeight + 5.0) { // Increased buffer slightly
              return res.status(400).json({ error: `Security Warning: Pure weight (${pure_weight}g) is significantly higher than Sent Weight!` });
         }
 
@@ -131,11 +142,13 @@ router.post('/use-stock', async (req, res) => {
         const { batch_id, use_weight, transfer_to, recipient_id, item_name, metal_type } = req.body;
         
         const batchRes = await client.query("SELECT pure_weight, used_weight FROM refinery_batches WHERE id=$1", [batch_id]);
+        if (batchRes.rows.length === 0) throw new Error("Batch not found");
+
         const batch = batchRes.rows[0];
         const available = parseFloat(batch.pure_weight) - parseFloat(batch.used_weight || 0);
         const weightToUse = parseFloat(use_weight);
 
-        if (weightToUse > available + 0.01) throw new Error(`Insufficient Pure Weight. Available: ${available.toFixed(3)}g`);
+        if (weightToUse > available + 0.05) throw new Error(`Insufficient Pure Weight. Available: ${available.toFixed(3)}g`);
 
         if (transfer_to === 'VENDOR') {
             await client.query(
