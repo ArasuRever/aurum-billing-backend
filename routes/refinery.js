@@ -17,28 +17,26 @@ router.get('/pending-scrap', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. CREATE BATCH (Fixed to support Manual Weight)
+// 2. CREATE BATCH (Added Net Weight handling)
 router.post('/create-batch', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        // 'manual_weight' added
-        const { metal_type, item_ids, manual_weight } = req.body; 
+        const { metal_type, item_ids, manual_weight, net_weight } = req.body; 
 
         let listGross = 0;
         
-        // Only query items if IDs are provided
         if (item_ids && item_ids.length > 0) {
             const itemsRes = await client.query("SELECT id, gross_weight FROM old_metal_items WHERE id = ANY($1::int[])", [item_ids]);
             listGross = itemsRes.rows.reduce((sum, item) => sum + parseFloat(item.gross_weight), 0);
             
-            // Mark items as BATCHED
-            await client.query(`UPDATE old_metal_items SET status = 'BATCHED', batch_id = $1 WHERE id = ANY($2::int[])`, [0, item_ids]); // We'll update batch_id later
+            // Mark items as BATCHED (batch_id updated later)
+            await client.query(`UPDATE old_metal_items SET status = 'BATCHED', batch_id = 0 WHERE id = ANY($1::int[])`, [item_ids]);
         }
 
-        // Sum up
         const manual = parseFloat(manual_weight) || 0;
         const totalGross = listGross + manual;
+        const totalNet = parseFloat(net_weight) || 0; // Editable Net Weight from UI
 
         if (totalGross <= 0) throw new Error("Batch weight cannot be zero.");
 
@@ -46,14 +44,15 @@ router.post('/create-batch', async (req, res) => {
         const count = parseInt(batchCountRes.rows[0].count) + 1;
         const batchNo = `RB-${metal_type.charAt(0)}-${String(count).padStart(4, '0')}`;
 
+        // Insert Batch with Pure Weight (Net Weight) estimate
         const batchRes = await client.query(`
-            INSERT INTO refinery_batches (batch_no, metal_type, gross_weight, status, sent_date)
-            VALUES ($1, $2, $3, 'SENT', NOW()) RETURNING id`,
-            [batchNo, metal_type, totalGross]
+            INSERT INTO refinery_batches (batch_no, metal_type, gross_weight, pure_weight, status, sent_date)
+            VALUES ($1, $2, $3, $4, 'SENT', NOW()) RETURNING id`,
+            [batchNo, metal_type, totalGross, totalNet]
         );
         const batchId = batchRes.rows[0].id;
 
-        // Now link the items to the real batch ID
+        // Link items
         if (item_ids && item_ids.length > 0) {
             await client.query(`UPDATE old_metal_items SET batch_id = $1 WHERE id = ANY($2::int[])`, [batchId, item_ids]);
         }
@@ -89,7 +88,7 @@ router.post('/receive-refined', async (req, res) => {
         const tch = parseFloat(touch);
         const pure_weight = (refined * (tch / 100)).toFixed(3);
 
-        if (parseFloat(pure_weight) > sentWeight + 0.5) { // Small buffer for scale variance
+        if (parseFloat(pure_weight) > sentWeight + 0.5) { 
              return res.status(400).json({ error: `Security Warning: Pure weight (${pure_weight}g) exceeds Sent Weight (${sentWeight}g)!` });
         }
 
@@ -120,7 +119,6 @@ router.post('/use-stock', async (req, res) => {
 
         if (weightToUse > available + 0.01) throw new Error(`Insufficient Pure Weight. Available: ${available.toFixed(3)}g`);
 
-        // --- HANDLE TRANSFERS ---
         if (transfer_to === 'VENDOR') {
             await client.query(
                 `UPDATE vendors SET balance_pure_weight = balance_pure_weight + $1 WHERE id = $2`,
@@ -152,7 +150,6 @@ router.post('/use-stock', async (req, res) => {
             `, [metal_type, item_name || 'Refined Bar', weightToUse, barcode]);
         }
 
-        // Update Batch Status
         await client.query(`
             UPDATE refinery_batches 
             SET used_weight = COALESCE(used_weight, 0) + $1,

@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db'); 
 
-// 1. GET STATS (Calculates "Purchase" vs "Exchange" dynamically)
+// 1. GET STATS (Calculates "Purchase" vs "Exchange" dynamically with Gross/Net)
 router.get('/stats', async (req, res) => {
     try {
         const goldStats = await pool.query(`
@@ -61,7 +61,6 @@ router.get('/stats', async (req, res) => {
     }
 });
 
-// ... (Rest of the file remains unchanged: list, purchase, delete) ...
 // 2. GET LIST (HISTORY)
 router.get('/list', async (req, res) => {
     try {
@@ -81,7 +80,7 @@ router.get('/list', async (req, res) => {
     }
 });
 
-// 3. ADD PURCHASE (Unchanged)
+// 3. ADD PURCHASE
 router.post('/purchase', async (req, res) => {
     const client = await pool.connect();
     try {
@@ -131,7 +130,7 @@ router.post('/purchase', async (req, res) => {
     }
 });
 
-// 4. DELETE PURCHASE (Unchanged)
+// 4. DELETE PURCHASE
 router.delete('/:id', async (req, res) => {
     const client = await pool.connect();
     try {
