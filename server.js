@@ -8,7 +8,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Routes
+// --- ROUTES ---
+app.use('/api/auth', require('./routes/auth')); // <--- NEW AUTH ROUTE
 app.use('/api/vendors', require('./routes/vendors'));
 app.use('/api/inventory', require('./routes/inventory'));
 app.use('/api/billing', require('./routes/billing'));
@@ -21,10 +22,7 @@ app.use('/api/refinery', require('./routes/refinery'));
 app.use('/api/gst', require('./routes/gst_billing'));
 app.use('/api/dashboard', require('./routes/dashboard'));
 app.use('/api/audit', require('./routes/audit'));
-
-// --- NEW CHIT SCHEME ROUTE ---
 app.use('/api/chits', require('./routes/chits'));
-// -----------------------------
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
