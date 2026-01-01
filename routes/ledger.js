@@ -52,13 +52,15 @@ router.get('/history', async (req, res) => {
                 
                 UNION ALL
                 
-                -- 2. VENDORS
+                -- 2. VENDORS (Fixed: repaid_cash_amount)
                 SELECT id, 
                        'VENDOR_TXN' as type, 
                        description, 
                        repaid_cash_amount as cash_amount, 
+                       -- Strict Metal Separation
                        CASE WHEN metal_type = 'GOLD' THEN (stock_pure_weight + repaid_metal_weight) ELSE 0 END as gold_weight, 
                        CASE WHEN metal_type = 'SILVER' THEN (stock_pure_weight + repaid_metal_weight) ELSE 0 END as silver_weight,
+                       
                        CASE WHEN repaid_cash_amount > 0 THEN 'CASH' ELSE 'STOCK' END as payment_mode, 
                        created_at as date, 
                        CASE WHEN repaid_cash_amount > 0 THEN 'OUT' ELSE 'IN' END as direction,
@@ -101,7 +103,7 @@ router.get('/history', async (req, res) => {
 
                 UNION ALL
 
-                -- 5. OLD METAL (FIXED: ROBUST CONCAT for Description)
+                -- 5. OLD METAL (Includes Exchanges - FIXED WEIGHT CALCULATION)
                 SELECT p.id, 
                        'OLD_METAL' as type, 
                        CONCAT(
@@ -114,11 +116,22 @@ router.get('/history', async (req, res) => {
                            COALESCE((SELECT SUM(net_weight) FROM old_metal_items WHERE purchase_id = p.id), 0), 'g]'
                        ) as description, 
                        p.net_payout as cash_amount, 
-                       (SELECT COALESCE(SUM(net_weight), 0) FROM old_metal_items WHERE purchase_id = p.id AND (metal_type ILIKE '%GOLD%' OR metal_type = 'Au')) as gold_weight, 
-                       (SELECT COALESCE(SUM(net_weight), 0) FROM old_metal_items WHERE purchase_id = p.id AND (metal_type ILIKE '%SILVER%' OR metal_type ILIKE '%AG%')) as silver_weight,
+                       
+                       -- ROBUST GOLD CHECK: Matches 'Gold', 'Au', '22k', '916', etc.
+                       (SELECT COALESCE(SUM(net_weight), 0) FROM old_metal_items 
+                        WHERE purchase_id = p.id 
+                        AND (metal_type ILIKE '%GOLD%' OR metal_type = 'Au' OR metal_type ILIKE '%22K%' OR metal_type ILIKE '%916%')
+                       ) as gold_weight, 
+                       
+                       -- ROBUST SILVER CHECK: Matches 'Silver', 'Ag', 'Sterling', '925', etc.
+                       (SELECT COALESCE(SUM(net_weight), 0) FROM old_metal_items 
+                        WHERE purchase_id = p.id 
+                        AND (metal_type ILIKE '%SILVER%' OR metal_type ILIKE '%AG%' OR metal_type ILIKE '%STERLING%' OR metal_type ILIKE '%925%')
+                       ) as silver_weight,
+                       
                        p.payment_mode, 
                        p.date, 
-                       'OUT' as direction,
+                       'OUT' as direction, -- Cash goes OUT when we buy old metal
                        NULL::integer as reference_id, 
                        NULL::text as reference_type
                 FROM old_metal_purchases p
@@ -154,12 +167,31 @@ router.get('/history', async (req, res) => {
             const gw = parseFloat(row.gold_weight || 0);
             const sw = parseFloat(row.silver_weight || 0);
 
+            // 1. CASH LOGIC
             if (amt > 0) {
                 if(row.direction === 'IN') dayStats.income += amt;
                 else dayStats.expense += amt;
             }
 
-            if (row.type === 'OLD_METAL' || row.type === 'VENDOR_TXN' || row.type === 'SHOP_B2B' || row.type === 'REFINERY') {
+            // 2. METAL LOGIC (IN = We received metal, OUT = We gave metal)
+            
+            // OLD_METAL: We BUY metal from customer -> Metal comes IN to our stock
+            if (row.type === 'OLD_METAL') {
+                dayStats.gold_in += gw;
+                dayStats.silver_in += sw;
+            } 
+            // VENDOR: IN = Stock Added (Metal IN), OUT = Repayment (Metal OUT)
+            else if (row.type === 'VENDOR_TXN') {
+                if(row.direction === 'IN') {
+                    dayStats.gold_in += gw;
+                    dayStats.silver_in += sw;
+                } else {
+                    dayStats.gold_out += gw;
+                    dayStats.silver_out += sw;
+                }
+            }
+            // SHOP/REFINERY: Direction logic from query
+            else {
                 if(row.direction === 'IN') {
                     dayStats.gold_in += gw;
                     dayStats.silver_in += sw;
@@ -177,7 +209,6 @@ router.get('/history', async (req, res) => {
     }
 });
 
-// ... (Expense and Adjust routes remain same) ...
 // 3. ADD EXPENSE
 router.post('/expense', async (req, res) => {
     const { description, amount, category, payment_mode } = req.body;
