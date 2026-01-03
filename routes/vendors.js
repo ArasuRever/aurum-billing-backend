@@ -224,9 +224,10 @@ router.get('/:id/sales-history', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 13. SOFT DELETE VENDOR (AND REMOVE STOCK)
+// 13. SOFT DELETE VENDOR (WITH STOCK ACTION)
 router.delete('/:id', async (req, res) => {
     const { id } = req.params;
+    const { stock_action } = req.query; // 'DELETE' or 'MOVE'
     const client = await pool.connect();
     
     try {
@@ -242,16 +243,31 @@ router.delete('/:id', async (req, res) => {
         // 2. Soft Delete the Vendor
         await client.query("UPDATE vendors SET is_deleted = TRUE WHERE id = $1", [id]);
 
-        // 3. Remove/Delete their available stock items
-        const stockResult = await client.query(
-            `UPDATE inventory_items 
-             SET status = 'DELETED', is_deleted = TRUE 
-             WHERE vendor_id = $1 AND status = 'AVAILABLE'`,
-            [id]
-        );
+        let message = "Vendor deleted.";
+
+        // 3. Handle Inventory Items
+        if (stock_action === 'MOVE') {
+            // Option A: Move stocks to Own Shop Inventory
+            const moveResult = await client.query(
+                `UPDATE inventory_items 
+                 SET vendor_id = NULL, source_type = 'OWN' 
+                 WHERE vendor_id = $1 AND status = 'AVAILABLE' AND (is_deleted IS FALSE OR is_deleted IS NULL)`,
+                [id]
+            );
+            message += ` ${moveResult.rowCount} items moved to Shop Inventory.`;
+        } else {
+            // Option B: Delete stocks (Default)
+            const deleteResult = await client.query(
+                `UPDATE inventory_items 
+                 SET status = 'DELETED', is_deleted = TRUE 
+                 WHERE vendor_id = $1 AND status = 'AVAILABLE'`,
+                [id]
+            );
+            message += ` ${deleteResult.rowCount} items removed from stock.`;
+        }
 
         await client.query('COMMIT');
-        res.json({ success: true, message: `Vendor deleted and ${stockResult.rowCount} items removed from stock.` });
+        res.json({ success: true, message });
 
     } catch (err) {
         await client.query('ROLLBACK');

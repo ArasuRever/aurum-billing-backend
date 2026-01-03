@@ -170,7 +170,7 @@ router.post('/batch-add', async (req, res) => {
   }
 });
 
-// --- NEW SEARCH ROUTE ---
+// SEARCH ROUTE
 router.get('/search', async (req, res) => {
   const { q } = req.query;
   try {
@@ -222,10 +222,12 @@ router.get('/vendor/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 5. UPDATE ITEM
-router.put('/update/:id', async (req, res) => {
+// 5. UPDATE ITEM (With Name & Image Support)
+router.put('/update/:id', upload.single('item_image'), async (req, res) => {
   const { id } = req.params;
-  const { gross_weight, wastage_percent, update_comment } = req.body;
+  const { item_name, gross_weight, wastage_percent, update_comment } = req.body;
+  const item_image = req.file ? req.file.buffer : null;
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -233,6 +235,7 @@ router.put('/update/:id', async (req, res) => {
     const oldRes = await client.query('SELECT * FROM inventory_items WHERE id = $1', [id]);
     const oldItem = oldRes.rows[0];
     
+    if (!oldItem) throw new Error("Item not found");
     if (oldItem.status !== 'AVAILABLE') {
         throw new Error(`Cannot edit item. Current status is ${oldItem.status}`);
     }
@@ -242,15 +245,29 @@ router.put('/update/:id', async (req, res) => {
     const newPure = newGross * (newPurity / 100); 
     const diffPure = newPure - parseFloat(oldItem.pure_weight);
 
+    // Track Changes
     await client.query(`INSERT INTO item_updates (item_id, old_values, update_comment) VALUES ($1, $2, $3)`, [id, JSON.stringify(oldItem), update_comment]);
-    await client.query(`UPDATE inventory_items SET gross_weight=$1, wastage_percent=$2, pure_weight=$3 WHERE id=$4`, [newGross, newPurity, newPure, id]);
     
-    if (oldItem.vendor_id && diffPure !== 0) {
+    // Update Fields
+    if (item_image) {
+        await client.query(
+            `UPDATE inventory_items SET item_name=$1, gross_weight=$2, wastage_percent=$3, pure_weight=$4, item_image=$5 WHERE id=$6`, 
+            [item_name, newGross, newPurity, newPure, item_image, id]
+        );
+    } else {
+        await client.query(
+            `UPDATE inventory_items SET item_name=$1, gross_weight=$2, wastage_percent=$3, pure_weight=$4 WHERE id=$5`, 
+            [item_name, newGross, newPurity, newPure, id]
+        );
+    }
+    
+    // Update Ledger if needed
+    if (oldItem.vendor_id && Math.abs(diffPure) > 0.001) {
         await client.query(`UPDATE vendors SET balance_pure_weight = balance_pure_weight + $1 WHERE id = $2`, [diffPure, oldItem.vendor_id]);
         await client.query(
             `INSERT INTO vendor_transactions (vendor_id, type, description, stock_pure_weight, balance_after, metal_type)
              VALUES ($1, 'STOCK_UPDATE', $2, $3, (SELECT balance_pure_weight FROM vendors WHERE id=$1), $4)`,
-            [oldItem.vendor_id, `Updated Item: ${oldItem.item_name}`, diffPure, oldItem.metal_type]
+            [oldItem.vendor_id, `Updated: ${oldItem.item_name} (Wt Change)`, diffPure, oldItem.metal_type]
         );
     }
     await client.query('COMMIT');
@@ -278,10 +295,12 @@ router.delete('/:id', async (req, res) => {
         if (item.source_type === 'VENDOR' && item.vendor_id) {
             const reduction = parseFloat(item.pure_weight) || 0;
             await client.query('UPDATE vendors SET balance_pure_weight = balance_pure_weight - $1 WHERE id = $2', [reduction, item.vendor_id]);
+            
+            // Insert Repayment with Reference to allow Restore
             await client.query(
-              `INSERT INTO vendor_transactions (vendor_id, type, description, stock_pure_weight, repaid_metal_weight, balance_after, metal_type)
-               VALUES ($1, 'REPAYMENT', $2, 0, $3, (SELECT balance_pure_weight FROM vendors WHERE id=$1), $4)`,
-              [item.vendor_id, `Deleted: ${item.item_name}`, reduction, item.metal_type]
+              `INSERT INTO vendor_transactions (vendor_id, type, description, stock_pure_weight, repaid_metal_weight, balance_after, metal_type, reference_id, reference_type)
+               VALUES ($1, 'REPAYMENT', $2, 0, $3, (SELECT balance_pure_weight FROM vendors WHERE id=$1), $4, $5, 'ITEM_DELETE')`,
+              [item.vendor_id, `Deleted: ${item.item_name}`, reduction, item.metal_type, id]
             );
         }
     }
@@ -290,7 +309,7 @@ router.delete('/:id', async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// 7. RESTOCK BULK ITEM (NEW)
+// 7. RESTOCK BULK ITEM
 router.post('/restock/:id', async (req, res) => {
     const { id } = req.params;
     const { added_gross_weight, added_quantity, wastage_percent, invoice_no, description } = req.body;
@@ -309,10 +328,8 @@ router.post('/restock/:id', async (req, res) => {
         const addedQty = parseInt(added_quantity);
         const newWastage = wastage_percent ? parseFloat(wastage_percent) : parseFloat(item.wastage_percent);
         
-        // Calculate new Pure Weight added
         const addedPure = addedWt * (newWastage / 100);
 
-        // Update Inventory (Cumulative)
         await client.query(
             `UPDATE inventory_items 
              SET gross_weight = gross_weight + $1, 
@@ -326,14 +343,12 @@ router.post('/restock/:id', async (req, res) => {
             [addedWt, addedQty, addedPure, newWastage, id]
         );
 
-        // Log History
         await client.query(
             `INSERT INTO item_stock_logs (inventory_item_id, action_type, quantity_change, weight_change, related_bill_no, description)
              VALUES ($1, 'RESTOCK', $2, $3, $4, $5)`,
             [id, addedQty, addedWt, invoice_no, description || 'Restock Added']
         );
 
-        // Vendor Balance Logic
         if (item.vendor_id) {
             await client.query(`UPDATE vendors SET balance_pure_weight = balance_pure_weight + $1 WHERE id = $2`, [addedPure, item.vendor_id]);
             await client.query(
@@ -354,7 +369,7 @@ router.post('/restock/:id', async (req, res) => {
     }
 });
 
-// 8. GET ITEM HISTORY (NEW)
+// 8. GET ITEM HISTORY
 router.get('/history/:id', async (req, res) => {
     try {
         const result = await pool.query(
@@ -365,6 +380,108 @@ router.get('/history/:id', async (req, res) => {
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
+});
+
+// 9. RESTORE DELETED ITEM
+router.post('/restore/:id', async (req, res) => {
+    const { id } = req.params;
+    const client = await pool.connect();
+    
+    try {
+        await client.query('BEGIN');
+
+        // 1. Find the Item
+        const itemRes = await client.query("SELECT * FROM inventory_items WHERE id = $1", [id]);
+        if (itemRes.rows.length === 0) throw new Error("Item not found in database.");
+        const item = itemRes.rows[0];
+
+        // 2. Check if already active
+        if (!item.is_deleted) throw new Error("Item is already active (not deleted).");
+
+        // 3. Restore status
+        await client.query(
+            "UPDATE inventory_items SET status='AVAILABLE', is_deleted=FALSE WHERE id = $1", 
+            [id]
+        );
+
+        // 4. Restore Vendor Balance
+        if (item.source_type === 'VENDOR' && item.vendor_id) {
+            const pureVal = parseFloat(item.pure_weight) || 0;
+            await client.query(
+                `UPDATE vendors SET balance_pure_weight = balance_pure_weight + $1 WHERE id = $2`,
+                [pureVal, item.vendor_id]
+            );
+
+            // 5. Log Transaction
+            await client.query(
+                `INSERT INTO vendor_transactions 
+                (vendor_id, type, description, stock_pure_weight, balance_after, metal_type, reference_id, reference_type)
+                 VALUES ($1, 'STOCK_ADDED', $2, $3, (SELECT balance_pure_weight FROM vendors WHERE id=$1), $4, $5, 'ITEM_RESTORE')`,
+                [item.vendor_id, `Restored: ${item.item_name}`, pureVal, item.metal_type, id]
+            );
+        }
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: "Item Restored Successfully" });
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 10. GET OWN AVAILABLE ITEMS (NEW)
+router.get('/own/list', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM inventory_items 
+       WHERE source_type = 'OWN' 
+       AND status = 'AVAILABLE' 
+       AND (is_deleted IS FALSE OR is_deleted IS NULL)
+       ORDER BY created_at DESC`
+    );
+    const items = result.rows.map(item => ({
+      ...item,
+      item_image: item.item_image ? `data:image/jpeg;base64,${item.item_image.toString('base64')}` : null
+    }));
+    res.json(items);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 11. GET OWN SALES & LENT HISTORY (NEW)
+router.get('/own/history', async (req, res) => {
+    try {
+        const query = `
+            SELECT 
+                si.id, si.sale_id, si.item_name, si.sold_weight as gross_weight, 
+                si.quantity, si.sold_rate, si.total_item_price, s.created_at, 
+                ii.barcode, ii.metal_type, ii.item_image, 'SOLD' as status
+            FROM sale_items si
+            JOIN inventory_items ii ON si.item_id = ii.id
+            JOIN sales s ON si.sale_id = s.id
+            WHERE ii.source_type = 'OWN'
+            
+            UNION ALL
+            
+            SELECT 
+                st.id, st.shop_id as sale_id, st.description as item_name, st.gross_weight, 
+                st.quantity, 0 as sold_rate, 0 as total_item_price, st.created_at, 
+                ii.barcode, ii.metal_type, ii.item_image, 'LENT' as status
+            FROM shop_transactions st
+            JOIN inventory_items ii ON st.inventory_item_id = ii.id
+            WHERE ii.source_type = 'OWN' AND st.type = 'LEND_ADD'
+            
+            ORDER BY created_at DESC
+        `;
+        const result = await pool.query(query);
+        const history = result.rows.map(row => ({
+            ...row,
+            item_image: row.item_image ? `data:image/jpeg;base64,${row.item_image.toString('base64')}` : null
+        }));
+        res.json(history);
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 module.exports = router;
