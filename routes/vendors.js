@@ -13,30 +13,33 @@ router.post('/add', async (req, res) => {
   try {
     const result = await pool.query(
       `INSERT INTO vendors 
-       (business_name, contact_number, address, gst_number, vendor_type, balance_pure_weight) 
-       VALUES ($1, $2, $3, $4, $5, 0) RETURNING *`,
+       (business_name, contact_number, address, gst_number, vendor_type, balance_pure_weight, is_deleted) 
+       VALUES ($1, $2, $3, $4, $5, 0, FALSE) RETURNING *`,
       [business_name, contact_number, address, gst_number, vendor_type || 'BOTH']
     );
     res.json(result.rows[0]);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. SEARCH VENDORS
+// 2. SEARCH VENDORS (Filtered for is_deleted = FALSE)
 router.get('/search', async (req, res) => {
   const { q } = req.query;
   try {
     const result = await pool.query(
-      "SELECT * FROM vendors WHERE business_name ILIKE $1 OR contact_number ILIKE $1 ORDER BY id DESC",
+      `SELECT * FROM vendors 
+       WHERE (business_name ILIKE $1 OR contact_number ILIKE $1) 
+       AND is_deleted IS FALSE 
+       ORDER BY id DESC`,
       [`%${q || ''}%`]
     );
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. GET ALL VENDORS
+// 3. GET ALL VENDORS (Filtered for is_deleted = FALSE)
 router.get('/list', async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM vendors ORDER BY id DESC");
+    const result = await pool.query("SELECT * FROM vendors WHERE is_deleted IS FALSE ORDER BY id DESC");
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -190,24 +193,13 @@ router.get('/:id/inventory', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 12. GET VENDOR SALES & LENT HISTORY (COMBINED)
+// 12. GET VENDOR SALES & LENT HISTORY
 router.get('/:id/sales-history', async (req, res) => {
     try {
         const { id } = req.params;
         const query = `
             SELECT 
-                si.id,
-                si.sale_id,
-                si.item_name,
-                si.sold_weight as gross_weight,
-                si.quantity,
-                si.sold_rate,
-                si.total_item_price,
-                s.created_at,
-                ii.barcode,
-                ii.metal_type,
-                ii.item_image,
-                'SOLD' as status
+                si.id, si.sale_id, si.item_name, si.sold_weight as gross_weight, si.quantity, si.sold_rate, si.total_item_price, s.created_at, ii.barcode, ii.metal_type, ii.item_image, 'SOLD' as status
             FROM sale_items si
             JOIN inventory_items ii ON si.item_id = ii.id
             JOIN sales s ON si.sale_id = s.id
@@ -216,18 +208,7 @@ router.get('/:id/sales-history', async (req, res) => {
             UNION ALL
             
             SELECT 
-                st.id,
-                st.shop_id as sale_id,
-                st.description as item_name,
-                st.gross_weight,
-                st.quantity,
-                0 as sold_rate,
-                0 as total_item_price,
-                st.created_at,
-                ii.barcode,
-                ii.metal_type,
-                ii.item_image,
-                'LENT' as status
+                st.id, st.shop_id as sale_id, st.description as item_name, st.gross_weight, st.quantity, 0 as sold_rate, 0 as total_item_price, st.created_at, ii.barcode, ii.metal_type, ii.item_image, 'LENT' as status
             FROM shop_transactions st
             JOIN inventory_items ii ON st.inventory_item_id = ii.id
             WHERE ii.vendor_id = $1 AND st.type = 'LEND_ADD'
@@ -235,16 +216,48 @@ router.get('/:id/sales-history', async (req, res) => {
             ORDER BY created_at DESC
         `;
         const result = await pool.query(query, [id]);
-        
         const history = result.rows.map(row => ({
             ...row,
             item_image: row.item_image ? `data:image/jpeg;base64,${row.item_image.toString('base64')}` : null
         }));
-        
         res.json(history);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 13. SOFT DELETE VENDOR (AND REMOVE STOCK)
+router.delete('/:id', async (req, res) => {
+    const { id } = req.params;
+    const client = await pool.connect();
+    
+    try {
+        await client.query('BEGIN');
+
+        // 1. Check if Vendor exists
+        const check = await client.query("SELECT * FROM vendors WHERE id = $1", [id]);
+        if (check.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "Vendor not found" });
+        }
+
+        // 2. Soft Delete the Vendor
+        await client.query("UPDATE vendors SET is_deleted = TRUE WHERE id = $1", [id]);
+
+        // 3. Remove/Delete their available stock items
+        const stockResult = await client.query(
+            `UPDATE inventory_items 
+             SET status = 'DELETED', is_deleted = TRUE 
+             WHERE vendor_id = $1 AND status = 'AVAILABLE'`,
+            [id]
+        );
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: `Vendor deleted and ${stockResult.rowCount} items removed from stock.` });
+
     } catch (err) {
-        console.error(err);
+        await client.query('ROLLBACK');
         res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
     }
 });
 
