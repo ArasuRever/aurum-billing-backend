@@ -2,20 +2,36 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 
-// 1. GET INVOICE DETAILS
+// 1. GET INVOICE DETAILS (UPDATED)
 router.get('/invoice/:id', async (req, res) => {
     const { id } = req.params;
     try {
         let query = "SELECT * FROM sales WHERE invoice_number = $1";
         let params = [id];
+        
+        // Allow searching by internal ID if it's a number
         if (!isNaN(id)) {
              query = "SELECT * FROM sales WHERE id = $1 OR invoice_number = $2";
              params = [id, id];
         }
-        const sale = await pool.query(query, params);
-        if(sale.rows.length === 0) return res.status(404).json({error: "Invoice not found"});
-        const items = await pool.query("SELECT * FROM sale_items WHERE sale_id = $1", [sale.rows[0].id]);
-        res.json({ sale: sale.rows[0], items: items.rows });
+        
+        const saleRes = await pool.query(query, params);
+        if(saleRes.rows.length === 0) return res.status(404).json({error: "Invoice not found"});
+        
+        const sale = saleRes.rows[0];
+        
+        // Fetch Sold Items
+        const itemsRes = await pool.query("SELECT * FROM sale_items WHERE sale_id = $1", [sale.id]);
+        
+        // Fetch Exchange Items (THIS WAS MISSING)
+        const exchangeRes = await pool.query("SELECT * FROM sale_exchange_items WHERE sale_id = $1", [sale.id]);
+
+        res.json({ 
+            sale: sale, 
+            items: itemsRes.rows, 
+            exchangeItems: exchangeRes.rows 
+        });
+
     } catch(err) { res.status(500).json({error: err.message}); }
 });
 
