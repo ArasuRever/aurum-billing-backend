@@ -103,40 +103,73 @@ router.delete('/items/:id', async (req, res) => {
     res.json({ success: true });
 });
 
-// 4. BUSINESS PROFILE
+// 4. BUSINESS PROFILE & INVOICE CONFIG (UPDATED)
 router.get('/business', async (req, res) => {
     const result = await pool.query("SELECT * FROM business_settings ORDER BY id DESC LIMIT 1");
     if (result.rows.length > 0) {
         const row = result.rows[0];
         if (row.logo) row.logo = `data:image/png;base64,${row.logo.toString('base64')}`;
+        
+        // Ensure invoice_config is valid JSON
+        if (typeof row.invoice_config === 'string') {
+            try { row.invoice_config = JSON.parse(row.invoice_config); } catch(e) { row.invoice_config = {}; }
+        }
+        
         res.json(row);
     } else { res.json({}); }
 });
 
 router.post('/business', logoUpload.single('logo'), async (req, res) => {
-    const { business_name, address, contact_number, email, license_number, gst, display_preference } = req.body;
+    const { 
+        business_name, address, contact_number, email, 
+        license_number, gst, display_preference, invoice_config 
+    } = req.body;
+    
     const logoBuffer = req.file ? req.file.buffer : undefined;
     const client = await pool.connect();
+    
+    // Parse invoice_config if it came as a stringified JSON from FormData
+    let configJSON = invoice_config;
+    if (typeof invoice_config === 'string') {
+        try { configJSON = JSON.parse(invoice_config); } catch(e) { configJSON = {}; }
+    }
+
     try {
         await client.query('BEGIN');
         const check = await client.query("SELECT id FROM business_settings LIMIT 1");
+        
         if (check.rows.length === 0) {
-            await client.query(`INSERT INTO business_settings (business_name, address, contact_number, email, license_number, gst, display_preference, logo) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, [business_name, address, contact_number, email, license_number, gst, display_preference, logoBuffer]);
+            await client.query(
+                `INSERT INTO business_settings (business_name, address, contact_number, email, license_number, gst, display_preference, logo, invoice_config) 
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, 
+                [business_name, address, contact_number, email, license_number, gst, display_preference, logoBuffer, configJSON]
+            );
         } else {
             const id = check.rows[0].id;
-            let query = `UPDATE business_settings SET business_name=$1, address=$2, contact_number=$3, email=$4, license_number=$5, gst=$6, display_preference=$7`;
-            const params = [business_name, address, contact_number, email, license_number, gst, display_preference];
-            if (logoBuffer) { query += `, logo=$8 WHERE id=$9`; params.push(logoBuffer, id); } 
-            else { query += ` WHERE id=$8`; params.push(id); }
+            let query = `UPDATE business_settings SET business_name=$1, address=$2, contact_number=$3, email=$4, license_number=$5, gst=$6, display_preference=$7, invoice_config=$8`;
+            const params = [business_name, address, contact_number, email, license_number, gst, display_preference, configJSON];
+            
+            if (logoBuffer) { 
+                query += `, logo=$9 WHERE id=$10`; 
+                params.push(logoBuffer, id); 
+            } else { 
+                query += ` WHERE id=$9`; 
+                params.push(id); 
+            }
             await client.query(query, params);
         }
         await client.query('COMMIT');
         res.json({ success: true });
-    } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
+    } catch (err) { 
+        await client.query('ROLLBACK'); 
+        res.status(500).json({ error: err.message }); 
+    } finally { 
+        client.release(); 
+    }
 });
 
 // ==========================================
-// 5. BACKUP & RESTORE SYSTEM (NEW)
+// 5. BACKUP & RESTORE SYSTEM
 // ==========================================
 
 router.get('/backup', async (req, res) => {
