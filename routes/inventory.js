@@ -15,7 +15,7 @@ const getInitials = (str) => {
         .substring(0, 3); 
 };
 
-// 1. ADD ITEM
+// 1. ADD ITEM (Single)
 router.post('/add', upload.single('item_image'), async (req, res) => {
   const { 
     vendor_id, neighbour_shop_id, source_type, 
@@ -38,6 +38,7 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
     const finalSource = source_type || 'VENDOR'; 
     const gross = parseFloat(gross_weight) || 0;
     const purityVal = parseFloat(wastage_percent) || 0;
+    const mc = parseFloat(making_charges) || 0; // Prevent crash on empty string
     
     let pure_weight = 0;
     if (req.body.pure_weight) {
@@ -48,12 +49,11 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
 
     const qty = parseInt(quantity) || 1;
 
-    // INSERT ITEM
     const itemRes = await client.query(
       `INSERT INTO inventory_items 
       (vendor_id, neighbour_shop_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, item_image, status, stock_type, huid, quantity, total_quantity_added, total_weight_added)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'AVAILABLE', $12, $13, $14, $14, $7) RETURNING *`,
-      [vendor_id || null, neighbour_shop_id || null, finalSource, metal_type, item_name, barcode, gross, purityVal, making_charges, pure_weight, item_image, stock_type || 'SINGLE', huid || null, qty]
+      [vendor_id || null, neighbour_shop_id || null, finalSource, metal_type, item_name, barcode, gross, purityVal, mc, pure_weight, item_image, stock_type || 'SINGLE', huid || null, qty]
     );
     const newItem = itemRes.rows[0];
 
@@ -103,13 +103,14 @@ router.post('/batch-add', async (req, res) => {
     const processedItems = items.map(i => {
         const g = parseFloat(i.gross_weight) || 0;
         const p = parseFloat(i.wastage_percent) || 0;
+        const mc = parseFloat(i.making_charges) || 0; 
         const pure = i.pure_weight ? parseFloat(i.pure_weight) : (g * (p/100));
         const qty = parseInt(i.quantity) || 1; 
         
         totalGross += g;
         totalPure += pure;
         
-        return { ...i, g, p, pure, qty };
+        return { ...i, g, p, mc, pure, qty };
     });
 
     const batchRes = await client.query(
@@ -123,17 +124,16 @@ router.post('/batch-add', async (req, res) => {
 
     for (const item of processedItems) {
         const prefix = metal_type ? metal_type.charAt(0).toUpperCase() : 'X';
-        const barcode = `${prefix}-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random()*100)}`;
+        const barcode = `${prefix}-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random()*1000)}`;
         const imgBuffer = item.item_image_base64 ? Buffer.from(item.item_image_base64, 'base64') : null;
 
         const iRes = await client.query(
             `INSERT INTO inventory_items 
             (vendor_id, batch_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, status, stock_type, huid, item_image, quantity, total_quantity_added, total_weight_added)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'AVAILABLE', $11, $12, $13, $14, $14, $7) RETURNING id`,
-            [vendor_id || null, batchId, sourceType, metal_type, item.item_name, barcode, item.g, item.p, item.making_charges, item.pure, item.stock_type || 'SINGLE', item.huid || null, imgBuffer, item.qty]
+            [vendor_id || null, batchId, sourceType, metal_type, item.item_name, barcode, item.g, item.p, item.mc, item.pure, item.stock_type || 'SINGLE', item.huid || null, imgBuffer, item.qty]
         );
         
-        // LOG HISTORY
         await client.query(
             `INSERT INTO item_stock_logs (inventory_item_id, action_type, quantity_change, weight_change, description, related_bill_no)
              VALUES ($1, 'OPENING', $2, $3, 'Batch Import', $4)`,
@@ -432,7 +432,7 @@ router.post('/restore/:id', async (req, res) => {
     }
 });
 
-// 10. GET OWN AVAILABLE ITEMS (NEW)
+// 10. GET OWN AVAILABLE ITEMS
 router.get('/own/list', async (req, res) => {
   try {
     const result = await pool.query(
@@ -450,7 +450,7 @@ router.get('/own/list', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 11. GET OWN SALES & LENT HISTORY (NEW)
+// 11. GET OWN SALES & LENT HISTORY
 router.get('/own/history', async (req, res) => {
     try {
         const query = `
