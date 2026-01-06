@@ -97,6 +97,13 @@ router.post('/batch-add', async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    // --- FIX START: Handle 'OWN' vendor_id ---
+    let finalVendorId = vendor_id;
+    if (finalVendorId === 'OWN' || finalVendorId === '') {
+        finalVendorId = null;
+    }
+    // --- FIX END ---
+
     let totalGross = 0;
     let totalPure = 0;
     
@@ -113,14 +120,16 @@ router.post('/batch-add', async (req, res) => {
         return { ...i, g, p, mc, pure, qty };
     });
 
+    // Use finalVendorId instead of vendor_id
     const batchRes = await client.query(
         `INSERT INTO stock_batches (vendor_id, invoice_no, metal_type, total_gross_weight, total_pure_weight, item_count)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-        [vendor_id || null, invoice_no || 'MANUAL', metal_type, totalGross, totalPure, items.length]
+        [finalVendorId, invoice_no || 'MANUAL', metal_type, totalGross, totalPure, items.length]
     );
     const batchId = batchRes.rows[0].id;
 
-    const sourceType = vendor_id ? 'VENDOR' : 'OWN';
+    // Determine Source Type based on corrected ID
+    const sourceType = finalVendorId ? 'VENDOR' : 'OWN';
 
     for (const item of processedItems) {
         const prefix = metal_type ? metal_type.charAt(0).toUpperCase() : 'X';
@@ -131,7 +140,7 @@ router.post('/batch-add', async (req, res) => {
             `INSERT INTO inventory_items 
             (vendor_id, batch_id, source_type, metal_type, item_name, barcode, gross_weight, wastage_percent, making_charges, pure_weight, status, stock_type, huid, item_image, quantity, total_quantity_added, total_weight_added)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'AVAILABLE', $11, $12, $13, $14, $14, $7) RETURNING id`,
-            [vendor_id || null, batchId, sourceType, metal_type, item.item_name, barcode, item.g, item.p, item.mc, item.pure, item.stock_type || 'SINGLE', item.huid || null, imgBuffer, item.qty]
+            [finalVendorId, batchId, sourceType, metal_type, item.item_name, barcode, item.g, item.p, item.mc, item.pure, item.stock_type || 'SINGLE', item.huid || null, imgBuffer, item.qty]
         );
         
         await client.query(
@@ -141,10 +150,11 @@ router.post('/batch-add', async (req, res) => {
         );
     }
 
-    if (vendor_id) {
+    // Only update vendor balance if it's a real vendor (not null)
+    if (finalVendorId) {
         await client.query(
             `UPDATE vendors SET balance_pure_weight = balance_pure_weight + $1 WHERE id = $2`,
-            [totalPure, vendor_id]
+            [totalPure, finalVendorId]
         );
 
         const ledgerDesc = items.length === 1 
@@ -155,7 +165,7 @@ router.post('/batch-add', async (req, res) => {
             `INSERT INTO vendor_transactions 
             (vendor_id, type, description, stock_pure_weight, balance_after, metal_type, reference_id, reference_type)
              VALUES ($1, 'STOCK_ADDED', $2, $3, (SELECT balance_pure_weight FROM vendors WHERE id=$1), $4, $5, 'BATCH')`,
-            [vendor_id, ledgerDesc, totalPure, metal_type, batchId]
+            [finalVendorId, ledgerDesc, totalPure, metal_type, batchId]
         );
     }
 
