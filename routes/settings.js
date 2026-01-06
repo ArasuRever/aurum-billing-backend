@@ -7,8 +7,11 @@ const os = require('os');
 const path = require('path');
 
 // ==========================================
-// 1. UPLOAD CONFIGURATION
+// 1. CONFIGURATION
 // ==========================================
+
+// Current System Version - Increment this when you make major DB changes
+const SYSTEM_VERSION = '2.1'; 
 
 // Use system temp directory to prevent Nodemon from restarting the server
 const storage = multer.diskStorage({
@@ -53,11 +56,17 @@ const resetSequences = async (client) => {
 
     for (const table of tables) {
         try {
-            const res = await client.query(`SELECT column_name FROM information_schema.columns WHERE table_name=$1 AND column_name='id'`, [table]);
-            if (res.rows.length > 0) {
-                await client.query(`SELECT setval(pg_get_serial_sequence('${table}', 'id'), COALESCE(MAX(id), 0) + 1, false) FROM ${table}`);
+            // Only try to reset sequence if the table actually exists
+            const check = await client.query(`SELECT to_regclass('public.${table}')`);
+            if (check.rows[0].to_regclass) {
+                const res = await client.query(`SELECT column_name FROM information_schema.columns WHERE table_name=$1 AND column_name='id'`, [table]);
+                if (res.rows.length > 0) {
+                    await client.query(`SELECT setval(pg_get_serial_sequence('${table}', 'id'), COALESCE(MAX(id), 0) + 1, false) FROM ${table}`);
+                }
             }
-        } catch (e) { }
+        } catch (e) { 
+            console.warn(`Skipped sequence reset for ${table}: ${e.message}`);
+        }
     }
     console.log("Sequences Reset Done.");
 };
@@ -85,13 +94,6 @@ router.post('/rates', async (req, res) => {
                 [key, val]
             );
         }
-        if(req.body.metal_type) {
-            await pool.query(
-                `INSERT INTO daily_rates (metal_type, rate, updated_at) VALUES ($1, $2, NOW())
-                 ON CONFLICT (metal_type) DO UPDATE SET rate = $2, updated_at = NOW()`,
-                [req.body.metal_type, req.body.rate]
-            );
-        }
         res.json({ success: true });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -99,14 +101,17 @@ router.post('/rates', async (req, res) => {
 router.get('/types', async (req, res) => {
     try { const result = await pool.query("SELECT * FROM product_types ORDER BY id ASC"); res.json(result.rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 router.post('/types', async (req, res) => {
     const { name, metal_type, formula, display_color, hsn_code } = req.body;
     try { const resDb = await pool.query("INSERT INTO product_types (name, metal_type, formula, display_color, hsn_code) VALUES ($1, $2, $3, $4, $5) RETURNING *", [name, metal_type, formula, display_color, hsn_code]); res.json(resDb.rows[0]); } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 router.put('/types/:id', async (req, res) => {
     const { name, metal_type, formula, display_color, hsn_code } = req.body;
     try { await pool.query("UPDATE product_types SET name=$1, metal_type=$2, formula=$3, display_color=$4, hsn_code=$5 WHERE id=$6", [name, metal_type, formula, display_color, hsn_code, req.params.id]); res.json({ success: true }); } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 router.delete('/types/:id', async (req, res) => {
     try { await pool.query("DELETE FROM product_types WHERE id=$1", [req.params.id]); res.json({ success: true }); } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -114,6 +119,7 @@ router.delete('/types/:id', async (req, res) => {
 router.get('/items', async (req, res) => {
     try { const result = await pool.query("SELECT * FROM item_masters ORDER BY item_name ASC"); res.json(result.rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 router.post('/items/bulk', async (req, res) => {
     const { item_names, metal_type, default_wastage, mc_type, mc_value, calc_method, hsn_code } = req.body;
     const client = await pool.connect();
@@ -127,10 +133,12 @@ router.post('/items/bulk', async (req, res) => {
         res.json({ success: true });
     } catch(e) { await client.query('ROLLBACK'); res.status(500).json(e); } finally { client.release(); }
 });
+
 router.put('/items/:id', async (req, res) => {
     const { item_name, metal_type, default_wastage, mc_type, mc_value, calc_method, hsn_code } = req.body;
     try { await pool.query("UPDATE item_masters SET item_name=$1, metal_type=$2, default_wastage=$3, mc_type=$4, mc_value=$5, calc_method=$6, hsn_code=$7 WHERE id=$8", [item_name, metal_type, default_wastage, mc_type, mc_value, calc_method, hsn_code, req.params.id]); res.json({ success: true }); } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 router.delete('/items/:id', async (req, res) => {
     try { await pool.query("DELETE FROM item_masters WHERE id=$1", [req.params.id]); res.json({ success: true }); } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -172,7 +180,7 @@ router.post('/business', logoUpload.single('logo'), async (req, res) => {
 });
 
 // ==========================================
-// 3. BACKUP & RESTORE SYSTEM
+// 3. ROBUST BACKUP & RESTORE SYSTEM
 // ==========================================
 
 const DB_TABLES = [
@@ -189,16 +197,22 @@ const DB_TABLES = [
 
 router.get('/backup', async (req, res) => {
     try {
-        const backupData = { timestamp: new Date(), version: '2.0', data: {} };
+        // Tag backup with current system version
+        const backupData = { timestamp: new Date(), version: SYSTEM_VERSION, data: {} };
+        
         for (const table of DB_TABLES) {
             try {
+                // Only backup tables that exist
                 const check = await pool.query(`SELECT to_regclass('public.${table}')`);
                 if (check.rows[0].to_regclass) {
                     const rows = await pool.query(`SELECT * FROM ${table}`);
                     backupData.data[table] = rows.rows;
                 }
-            } catch (e) { }
+            } catch (e) { 
+                console.error(`Backup Error on ${table}:`, e.message);
+            }
         }
+        
         const fileName = `AURUM_BACKUP_${new Date().toISOString().slice(0,10)}.json`;
         res.setHeader('Content-Disposition', `attachment; filename=${fileName}`);
         res.setHeader('Content-Type', 'application/json');
@@ -215,11 +229,25 @@ router.post('/restore', uploadMiddleware, async (req, res) => {
 
         if (!backup.data) throw new Error("Invalid Backup Format");
 
-        if (backup.data['bills']) { backup.data['sales'] = backup.data['bills']; delete backup.data['bills']; }
-        if (backup.data['bill_items']) { backup.data['sale_items'] = backup.data['bill_items']; delete backup.data['bill_items']; }
+        const backupVersion = backup.version || '1.0';
+        console.log(`Restoring Backup Version ${backupVersion} on System Version ${SYSTEM_VERSION}`);
+
+        // --- MIGRATION LOGIC: Map Old Tables to New Schema ---
+        // V1.0 Compatibility: Map 'bills' to 'sales'
+        if (backup.data['bills']) { 
+            console.log("Migrating 'bills' -> 'sales'");
+            backup.data['sales'] = backup.data['bills']; 
+            delete backup.data['bills']; 
+        }
+        if (backup.data['bill_items']) { 
+            console.log("Migrating 'bill_items' -> 'sale_items'");
+            backup.data['sale_items'] = backup.data['bill_items']; 
+            delete backup.data['bill_items']; 
+        }
         
         await client.query('BEGIN');
         
+        // --- STEP 1: CLEANUP (Delete old data) ---
         const cleanupOrder = [
             'audit_scans', 'inventory_audits', 'gst_bill_exchange_items', 'gst_bill_items', 'gst_bills',
             'sale_payments', 'sale_exchange_items', 'sale_items', 'sales',
@@ -231,25 +259,36 @@ router.post('/restore', uploadMiddleware, async (req, res) => {
 
         for (const table of cleanupOrder) {
             const check = await client.query(`SELECT to_regclass('public.${table}')`);
-            if (check.rows[0].to_regclass) await client.query(`TRUNCATE TABLE ${table} RESTART IDENTITY CASCADE`);
+            if (check.rows[0].to_regclass) {
+                await client.query(`TRUNCATE TABLE ${table} RESTART IDENTITY CASCADE`);
+            }
         }
 
+        // --- STEP 2: RESTORE (Insert new data with Smart Matching) ---
         const restoreOrder = [...cleanupOrder].reverse();
         const BATCH_SIZE = 200; 
 
         for (const table of restoreOrder) {
             const rows = backup.data[table];
             if (rows && rows.length > 0) {
+                // 1. Check if table exists in current DB
                 const check = await client.query(`SELECT to_regclass('public.${table}')`);
-                if (!check.rows[0].to_regclass) continue;
+                if (!check.rows[0].to_regclass) {
+                    console.log(`Skipping table '${table}' (Not found in current DB)`);
+                    continue; 
+                }
 
+                // 2. Get Valid Columns from current DB Schema
                 const tableInfo = await client.query("SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1", [table]);
                 const validColumns = new Set(tableInfo.rows.map(r => r.column_name));
+                
+                // 3. Filter Backup Data: Only keep keys that exist as columns
                 const allKeys = Object.keys(rows[0]);
                 const validKeys = allKeys.filter(k => validColumns.has(k));
 
                 if (validKeys.length === 0) continue;
 
+                // 4. FIX: Validate Foreign Keys for Inventory (Prevent Crashes)
                 if (table === 'inventory_items') {
                     const [bRes, vRes, sRes] = await Promise.all([
                         client.query('SELECT id FROM stock_batches'),
@@ -259,6 +298,7 @@ router.post('/restore', uploadMiddleware, async (req, res) => {
                     const validBatches = new Set(bRes.rows.map(r => r.id));
                     const validVendors = new Set(vRes.rows.map(r => r.id));
                     const validShops = new Set(sRes.rows.map(r => r.id));
+                    
                     rows.forEach(row => {
                         if (row.batch_id && !validBatches.has(row.batch_id)) row.batch_id = null;
                         if (row.vendor_id && !validVendors.has(row.vendor_id)) row.vendor_id = null;
@@ -266,29 +306,40 @@ router.post('/restore', uploadMiddleware, async (req, res) => {
                     });
                 }
 
+                // 5. Bulk Insert
                 const cols = validKeys.map(k => `"${k}"`).join(", ");
                 for (let i = 0; i < rows.length; i += BATCH_SIZE) {
                     const batch = rows.slice(i, i + BATCH_SIZE);
                     const values = [];
                     const placeholders = [];
                     batch.forEach((row, rowIndex) => {
-                        const rowValues = validKeys.map(k => { let val = row[k]; if (val === "") return null; return val; });
+                        const rowValues = validKeys.map(k => { 
+                            let val = row[k]; 
+                            if (val === "") return null; 
+                            return val; 
+                        });
                         values.push(...rowValues);
                         const start = (rowIndex * validKeys.length) + 1;
                         const p = validKeys.map((_, idx) => `$${start + idx}`);
                         placeholders.push(`(${p.join(", ")})`);
                     });
-                    const query = `INSERT INTO ${table} (${cols}) VALUES ${placeholders.join(", ")}`;
-                    await client.query(query, values);
+                    
+                    if (placeholders.length > 0) {
+                        const query = `INSERT INTO ${table} (${cols}) VALUES ${placeholders.join(", ")}`;
+                        await client.query(query, values);
+                    }
                 }
             }
         }
 
-        // --- FIX SEQUENCES ---
+        // --- STEP 3: RESET SEQUENCES (Vital for auto-increment IDs) ---
         await resetSequences(client);
 
         await client.query('COMMIT');
+        
+        // Cleanup temp file
         try { await fs.promises.unlink(req.file.path); } catch(e) {}
+        
         res.json({ success: true, message: "System Restored Successfully" });
 
     } catch (err) {
