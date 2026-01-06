@@ -288,6 +288,25 @@ router.post('/restore', uploadMiddleware, async (req, res) => {
 
                 if (validKeys.length === 0) continue;
 
+                // --- DATA SANITIZATION (The Fix) ---
+                // Handle Null Product Type Names
+                if (table === 'product_types') {
+                    rows.forEach(r => { 
+                        if (!r.name) r.name = "Unknown Type " + Math.floor(Math.random() * 1000); 
+                        if (!r.metal_type) r.metal_type = "GOLD"; 
+                    });
+                }
+                // Handle Null Item Names
+                if (table === 'item_masters') {
+                    rows.forEach(r => { if (!r.item_name) r.item_name = "Unknown Item"; });
+                }
+                // FIX: Handle Null Customer Names
+                if (table === 'customers') {
+                    rows.forEach(r => { 
+                        if (!r.name) r.name = "Unknown Customer " + Math.floor(Math.random() * 1000); 
+                    });
+                }
+
                 // 4. FIX: Validate Foreign Keys for Inventory (Prevent Crashes)
                 if (table === 'inventory_items') {
                     const [bRes, vRes, sRes] = await Promise.all([
