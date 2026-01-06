@@ -1,5 +1,5 @@
 const { Pool } = require('pg');
-require('dotenv').config();
+// require('dotenv').config(); // <-- REMOVED (Loaded in server.js)
 
 const pool = new Pool({
   user: process.env.DB_USER,
@@ -10,7 +10,7 @@ const pool = new Pool({
 });
 
 pool.on('connect', () => {
-  console.log('✅ Connected to PostgreSQL Database');
+  // console.log('✅ Connected to PostgreSQL Database'); // Optional: Commented out to reduce noise
 });
 
 pool.on('error', (err) => {
@@ -18,5 +18,4 @@ pool.on('error', (err) => {
   process.exit(-1);
 });
 
-// Export the pool directly
 module.exports = pool;

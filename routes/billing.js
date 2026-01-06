@@ -1,15 +1,30 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
+const { logAction } = require('../services/auditService'); // Import the Audit Service
+const jwt = require('jsonwebtoken'); // Needed to identify who is doing the action
 
-// 1. GET INVOICE DETAILS (UPDATED)
+// --- HELPER: Identify User from Token ---
+// This ensures we know WHO is creating/deleting the bill, even if the route is public
+const getUserFromRequest = (req) => {
+    try {
+        const token = req.header('Authorization')?.split(' ')[1];
+        if (token && process.env.JWT_SECRET) {
+            return jwt.verify(token, process.env.JWT_SECRET);
+        }
+    } catch (e) {
+        // Token invalid or expired, user remains null
+    }
+    return null;
+};
+
+// 1. GET INVOICE DETAILS
 router.get('/invoice/:id', async (req, res) => {
     const { id } = req.params;
     try {
         let query = "SELECT * FROM sales WHERE invoice_number = $1";
         let params = [id];
         
-        // Allow searching by internal ID if it's a number
         if (!isNaN(id)) {
              query = "SELECT * FROM sales WHERE id = $1 OR invoice_number = $2";
              params = [id, id];
@@ -19,11 +34,7 @@ router.get('/invoice/:id', async (req, res) => {
         if(saleRes.rows.length === 0) return res.status(404).json({error: "Invoice not found"});
         
         const sale = saleRes.rows[0];
-        
-        // Fetch Sold Items
         const itemsRes = await pool.query("SELECT * FROM sale_items WHERE sale_id = $1", [sale.id]);
-        
-        // Fetch Exchange Items (THIS WAS MISSING)
         const exchangeRes = await pool.query("SELECT * FROM sale_exchange_items WHERE sale_id = $1", [sale.id]);
 
         res.json({ 
@@ -40,7 +51,9 @@ router.get('/search-item', async (req, res) => {
   const { q } = req.query;
   try {
     const result = await pool.query(
-      `SELECT * FROM inventory_items WHERE (barcode = $1 OR item_name ILIKE $2) AND status = 'AVAILABLE'`,
+      `SELECT id, item_name, barcode, gross_weight, wastage_percent, making_charges, metal_type, stock_type, status, item_image 
+       FROM inventory_items 
+       WHERE (barcode = $1 OR item_name ILIKE $2) AND status = 'AVAILABLE'`,
       [q, `%${q}%`]
     );
     const items = result.rows.map(item => ({
@@ -51,18 +64,54 @@ router.get('/search-item', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. CREATE BILL (Updated for Bulk Qty)
+// 3. CREATE BILL (SECURE & LOGGED)
 router.post('/create-bill', async (req, res) => {
   const { customer, items, exchangeItems, totals, includeGST } = req.body;
   const client = await pool.connect();
+  req.user = getUserFromRequest(req); // Capture User for Audit Log
+  
   try {
     await client.query('BEGIN');
-    const invoiceNumber = `INV-${Date.now()}`;
 
+    // --- SECURITY CHECK: VERIFY TOTALS ---
+    let backendGrossTotal = 0;
+    
+    for (const item of items) {
+        let itemTotal = 0;
+        if (item.item_id) {
+             const dbItemRes = await client.query(
+                 "SELECT * FROM inventory_items WHERE id = $1 AND status = 'AVAILABLE' FOR UPDATE", 
+                 [item.item_id]
+             );
+             
+             if (dbItemRes.rows.length === 0 && item.stock_type !== 'BULK') {
+                 throw new Error(`Item ${item.item_name} is no longer available.`);
+             }
+             itemTotal = item.total; 
+        } else {
+             if (item.total < 0) throw new Error("Negative item total detected");
+             itemTotal = item.total;
+        }
+        backendGrossTotal += parseFloat(itemTotal);
+    }
+
+    const backendExchangeTotal = exchangeItems.reduce((acc, ex) => acc + parseFloat(ex.total), 0);
+    const backendTaxable = backendGrossTotal - (totals.totalDiscount || 0); 
+    const backendSGST = includeGST ? (backendTaxable * 0.015) : 0;
+    const backendCGST = includeGST ? (backendTaxable * 0.015) : 0;
+    const backendNetRaw = backendTaxable + backendSGST + backendCGST - backendExchangeTotal;
+    const backendNet = Math.round(backendNetRaw / 10) * 10; 
+
+    if (Math.abs(backendNet - totals.netPayable) > 1.00) {
+        throw new Error(`Security Alert: Price Mismatch. Server: ${backendNet}, Client: ${totals.netPayable}`);
+    }
+    // --- END SECURITY CHECK ---
+
+    const invoiceNumber = `INV-${Date.now()}`;
     const cashReceived = parseFloat(totals.cashReceived) || 0;
     const onlineReceived = parseFloat(totals.onlineReceived) || 0;
-    const totalPaid = parseFloat(totals.paidAmount) || 0;
-    const balance = parseFloat(totals.balance) || 0;
+    const totalPaid = cashReceived + onlineReceived; 
+    const balance = backendNet - totalPaid;
     const status = balance > 0 ? 'PARTIAL' : 'PAID';
 
     // A. Create Sale Record
@@ -74,9 +123,9 @@ router.post('/create-bill', async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11, $12, $13, $14, $15) RETURNING id`,
       [
         invoiceNumber, customer.name, customer.phone, 
-        totals.grossTotal || 0, totals.totalDiscount || 0, totals.taxableAmount || 0, 
-        totals.sgst || 0, totals.cgst || 0, totals.roundOff || 0, 
-        totals.netPayable, totals.exchangeTotal || 0, includeGST, totalPaid, balance, status
+        totals.grossTotal, totals.totalDiscount, totals.taxableAmount, 
+        backendSGST, backendCGST, totals.roundOff, 
+        backendNet, totals.exchangeTotal, includeGST, totalPaid, balance, status
       ]
     );
     const saleId = saleRes.rows[0].id;
@@ -93,14 +142,14 @@ router.post('/create-bill', async (req, res) => {
 
     // B. Process Sale Items
     for (const item of items) {
-      const qty = parseInt(item.quantity) || 1; // Get Qty from frontend
+      const qty = parseInt(item.quantity) || 1;
 
       await client.query(
         `INSERT INTO sale_items (sale_id, item_id, item_name, sold_weight, sold_rate, making_charges_collected, total_item_price, quantity) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
         [saleId, item.item_id || null, item.item_name, item.gross_weight, item.rate, item.making_charges || 0, item.total, qty]
       );
 
-      // Handle Inventory & Neighbor Debt
+      // Handle Inventory
       let neighbourIdToUpdate = null;
       let weightForDebt = 0;
       let description = '';
@@ -115,39 +164,17 @@ router.post('/create-bill', async (req, res) => {
             metalType = dbItem.metal_type;
 
             if (dbItem.stock_type === 'BULK') {
-                const currentWt = parseFloat(dbItem.gross_weight);
-                const currentQty = parseInt(dbItem.quantity) || 0;
-                
-                const newWt = currentWt - soldWt;
-                const newQty = Math.max(0, currentQty - qty); // Deduct Qty
-                
+                const newWt = Math.max(0, parseFloat(dbItem.gross_weight) - soldWt);
+                const newQty = Math.max(0, (parseInt(dbItem.quantity) || 0) - qty);
                 const newPure = newWt * (parseFloat(dbItem.wastage_percent)/100);
                 const newStatus = (newWt < 0.01 && newQty === 0) ? 'SOLD' : 'AVAILABLE';
                 
-                await client.query(
-                    `UPDATE inventory_items 
-                     SET gross_weight = $1, pure_weight = $2, quantity = $3, status = $4 
-                     WHERE id = $5`,
-                    [newWt, newPure, newQty, newStatus, item.item_id]
-                );
-                
-                // Log Stock Change
-                await client.query(
-                    `INSERT INTO item_stock_logs (inventory_item_id, action_type, quantity_change, weight_change, related_bill_no, description)
-                     VALUES ($1, 'SALE', $2, $3, $4, 'Item Sold')`,
-                    [item.item_id, -qty, -soldWt, invoiceNumber]
-                );
-
-                description = `Bulk Sold: ${item.item_name} (${soldWt}g, Qty:${qty})`;
+                await client.query(`UPDATE inventory_items SET gross_weight = $1, pure_weight = $2, quantity = $3, status = $4 WHERE id = $5`, [newWt, newPure, newQty, newStatus, item.item_id]);
+                await client.query(`INSERT INTO item_stock_logs (inventory_item_id, action_type, quantity_change, weight_change, related_bill_no, description) VALUES ($1, 'SALE', $2, $3, $4, 'Item Sold')`, [item.item_id, -qty, -soldWt, invoiceNumber]);
+                description = `Bulk Sold: ${item.item_name} (${soldWt}g)`;
             } else {
-                // SINGLE Item
                 await client.query(`UPDATE inventory_items SET status = 'SOLD' WHERE id = $1`, [item.item_id]);
-                // Log Single Item Sale
-                await client.query(
-                    `INSERT INTO item_stock_logs (inventory_item_id, action_type, quantity_change, weight_change, related_bill_no, description)
-                     VALUES ($1, 'SALE', -1, $2, $3, 'Item Sold')`,
-                    [item.item_id, -soldWt, invoiceNumber]
-                );
+                await client.query(`INSERT INTO item_stock_logs (inventory_item_id, action_type, quantity_change, weight_change, related_bill_no, description) VALUES ($1, 'SALE', -1, $2, $3, 'Item Sold')`, [item.item_id, -soldWt, invoiceNumber]);
                 description = `Sold Item: ${item.item_name} (${dbItem.barcode})`;
             }
 
@@ -163,26 +190,22 @@ router.post('/create-bill', async (req, res) => {
       }
 
       if (neighbourIdToUpdate && weightForDebt > 0) {
-          if (metalType === 'SILVER') {
-              await client.query(`UPDATE external_shops SET balance_silver = balance_silver + $1 WHERE id = $2`, [weightForDebt, neighbourIdToUpdate]);
-              await client.query(`INSERT INTO shop_transactions (shop_id, type, description, gross_weight, pure_weight, silver_weight, cash_amount) VALUES ($1, 'BORROW_ADD', $2, $3, 0, $4, 0)`, [neighbourIdToUpdate, description, item.gross_weight, weightForDebt]);
-          } else {
-              await client.query(`UPDATE external_shops SET balance_gold = balance_gold + $1 WHERE id = $2`, [weightForDebt, neighbourIdToUpdate]);
-              await client.query(`INSERT INTO shop_transactions (shop_id, type, description, gross_weight, pure_weight, silver_weight, cash_amount) VALUES ($1, 'BORROW_ADD', $2, $3, $4, 0, 0)`, [neighbourIdToUpdate, description, item.gross_weight, weightForDebt]);
-          }
+          const debtCol = metalType === 'SILVER' ? 'balance_silver' : 'balance_gold';
+          const silverWt = metalType === 'SILVER' ? weightForDebt : 0;
+          const goldWt = metalType === 'SILVER' ? 0 : weightForDebt;
+          
+          await client.query(`UPDATE external_shops SET ${debtCol} = ${debtCol} + $1 WHERE id = $2`, [weightForDebt, neighbourIdToUpdate]);
+          await client.query(`INSERT INTO shop_transactions (shop_id, type, description, gross_weight, pure_weight, silver_weight, cash_amount) VALUES ($1, 'BORROW_ADD', $2, $3, $4, $5, 0)`, [neighbourIdToUpdate, description, item.gross_weight, goldWt, silverWt]);
       }
     }
 
-    // C. Exchange Items (Updated with Auto-Calculation)
+    // C. Exchange Items
     if (exchangeItems && exchangeItems.length > 0) {
-      
-      const exTotal = exchangeItems.reduce((sum, ex) => sum + parseFloat(ex.total), 0);
-      
       const omRes = await client.query(
           `INSERT INTO old_metal_purchases 
           (voucher_no, customer_name, mobile, total_amount, net_payout, payment_mode, date)
           VALUES ($1, $2, $3, $4, 0, 'EXCHANGE', NOW()) RETURNING id`,
-          [`EX-${invoiceNumber}`, customer.name, customer.phone, exTotal]
+          [`EX-${invoiceNumber}`, customer.name, customer.phone, backendExchangeTotal]
       );
       const omId = omRes.rows[0].id;
 
@@ -207,21 +230,36 @@ router.post('/create-bill', async (req, res) => {
     }
 
     await client.query('COMMIT');
+
+    // --- AUDIT LOG: RECORD THE SALE ---
+    await logAction(req, 'BILL_CREATED', `Created Bill #${invoiceNumber} Amount: ₹${backendNet}`, invoiceNumber);
+    // ----------------------------------
+
     res.json({ success: true, message: 'Bill created', invoice_id: invoiceNumber });
-  } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ success: false, error: err.message }); } finally { client.release(); }
+  } catch (err) { 
+      await client.query('ROLLBACK'); 
+      console.error("Billing Error:", err);
+      res.status(500).json({ success: false, error: err.message }); 
+  } finally { 
+      client.release(); 
+  }
 });
 
-// 4. ADD BALANCE PAYMENT
+// 4. ADD BALANCE PAYMENT (SECURE & LOGGED)
 router.post('/add-payment', async (req, res) => {
     const { sale_id, amount, payment_mode, note } = req.body;
     const client = await pool.connect();
+    req.user = getUserFromRequest(req); // Capture User
+
     try {
         await client.query('BEGIN');
         const saleRes = await client.query("SELECT * FROM sales WHERE id = $1 FOR UPDATE", [sale_id]);
         if (saleRes.rows.length === 0) throw new Error("Bill not found");
         const sale = saleRes.rows[0];
+        
         const payAmount = parseFloat(amount);
         if (payAmount > parseFloat(sale.balance_amount)) throw new Error(`Amount exceeds balance!`);
+        
         await client.query("INSERT INTO sale_payments (sale_id, amount, payment_mode, note) VALUES ($1, $2, $3, $4)", [sale_id, payAmount, payment_mode || 'CASH', note]);
         
         const col = (payment_mode === 'ONLINE' || payment_mode === 'BANK') ? 'bank_balance' : 'cash_balance';
@@ -229,9 +267,15 @@ router.post('/add-payment', async (req, res) => {
 
         const newPaid = parseFloat(sale.paid_amount) + payAmount;
         const newBalance = parseFloat(sale.balance_amount) - payAmount;
-        const newStatus = newBalance <= 0 ? 'PAID' : 'PARTIAL';
+        const newStatus = newBalance <= 0.1 ? 'PAID' : 'PARTIAL';
+        
         await client.query("UPDATE sales SET paid_amount = $1, balance_amount = $2, payment_status = $3, last_payment_date = NOW() WHERE id = $4", [newPaid, newBalance, newStatus, sale_id]);
         await client.query('COMMIT');
+
+        // --- AUDIT LOG ---
+        await logAction(req, 'PAYMENT_ADDED', `Received ₹${payAmount} for Bill #${sale.invoice_number}`, sale.invoice_number);
+        // -----------------
+
         res.json({ success: true, message: "Payment Recorded", new_balance: newBalance });
     } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
@@ -243,15 +287,17 @@ router.get('/payments/:sale_id', async (req, res) => {
 
 // 6. GET HISTORY
 router.get('/history', async (req, res) => {
-    try { const result = await pool.query(`SELECT * FROM sales ORDER BY id DESC`); res.json(result.rows); } catch (err) { res.status(500).json({ error: err.message }); }
+    try { const result = await pool.query(`SELECT * FROM sales ORDER BY id DESC LIMIT 500`); res.json(result.rows); } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 7. DELETE BILL (Standard)
+// 7. DELETE BILL (SECURE & LOGGED)
 router.delete('/delete/:id', async (req, res) => {
     const { id } = req.params;
     const { restore_mode } = req.query; 
 
     const client = await pool.connect();
+    req.user = getUserFromRequest(req); // Capture User
+
     try {
       await client.query('BEGIN');
 
@@ -259,7 +305,7 @@ router.delete('/delete/:id', async (req, res) => {
       
       for (const saleItem of itemsRes.rows) {
           if (!saleItem.item_id) continue; 
-          const invRes = await client.query(`SELECT * FROM inventory_items WHERE id = $1`, [saleItem.item_id]);
+          const invRes = await client.query(`SELECT * FROM inventory_items WHERE id = $1 FOR UPDATE`, [saleItem.item_id]);
           const invItem = invRes.rows[0];
 
           if (invItem) {
@@ -275,9 +321,9 @@ router.delete('/delete/:id', async (req, res) => {
                       const weight = parseFloat(saleItem.sold_weight);
                       const shopId = invItem.neighbour_shop_id;
                       const isSilver = invItem.metal_type === 'SILVER';
+                      const col = isSilver ? 'balance_silver' : 'balance_gold';
 
-                      if (isSilver) await client.query(`UPDATE external_shops SET balance_silver = balance_silver - $1 WHERE id = $2`, [weight, shopId]);
-                      else await client.query(`UPDATE external_shops SET balance_gold = balance_gold - $1 WHERE id = $2`, [weight, shopId]);
+                      await client.query(`UPDATE external_shops SET ${col} = ${col} - $1 WHERE id = $2`, [weight, shopId]);
 
                       await client.query(
                           `INSERT INTO shop_transactions (shop_id, type, description, gross_weight, pure_weight, silver_weight, cash_amount) 
@@ -289,7 +335,7 @@ router.delete('/delete/:id', async (req, res) => {
 
               if (invItem.stock_type === 'BULK') {
                   const soldWt = parseFloat(saleItem.sold_weight);
-                  const soldQty = parseInt(saleItem.quantity) || 1; // Default to 1 if not stored
+                  const soldQty = parseInt(saleItem.quantity) || 1;
                   const purity = parseFloat(invItem.wastage_percent);
                   const pureWt = soldWt * (purity / 100);
                   
@@ -299,7 +345,6 @@ router.delete('/delete/:id', async (req, res) => {
                       [soldWt, pureWt, soldQty, newSource, newNeighbourId, invItem.id]
                   );
                   
-                  // Log Undo
                   await client.query(
                     `INSERT INTO item_stock_logs (inventory_item_id, action_type, quantity_change, weight_change, description)
                      VALUES ($1, 'RETURN', $2, $3, 'Bill Voided')`,
@@ -311,7 +356,6 @@ router.delete('/delete/:id', async (req, res) => {
                       `UPDATE inventory_items SET status = 'AVAILABLE', source_type = $1, neighbour_shop_id = $2 WHERE id = $3`,
                       [newSource, newNeighbourId, invItem.id]
                   );
-                  // Log Undo
                   await client.query(
                     `INSERT INTO item_stock_logs (inventory_item_id, action_type, quantity_change, weight_change, description)
                      VALUES ($1, 'RETURN', 1, $2, 'Bill Voided')`,
@@ -322,8 +366,9 @@ router.delete('/delete/:id', async (req, res) => {
       }
 
       const saleInfo = await client.query("SELECT invoice_number FROM sales WHERE id = $1", [id]);
-      if(saleInfo.rows.length > 0) {
-          const invNo = saleInfo.rows[0].invoice_number;
+      const invNo = saleInfo.rows.length > 0 ? saleInfo.rows[0].invoice_number : 'UNKNOWN';
+
+      if(invNo !== 'UNKNOWN') {
           await client.query("DELETE FROM old_metal_items WHERE purchase_id IN (SELECT id FROM old_metal_purchases WHERE voucher_no = $1)", [`EX-${invNo}`]);
           await client.query("DELETE FROM old_metal_purchases WHERE voucher_no = $1", [`EX-${invNo}`]);
       }
@@ -334,6 +379,11 @@ router.delete('/delete/:id', async (req, res) => {
       await client.query("DELETE FROM sales WHERE id = $1", [id]);
       
       await client.query('COMMIT');
+
+      // --- AUDIT LOG ---
+      await logAction(req, 'BILL_DELETED', `Voided Bill #${invNo}`, invNo);
+      // -----------------
+
       res.json({ success: true, message: "Bill Voided Successfully" });
     } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
@@ -356,8 +406,9 @@ router.post('/process-return', async (req, res) => {
                      const weight = parseFloat(item.gross_weight);
                      const shopId = invItem.neighbour_shop_id;
                      const isSilver = invItem.metal_type === 'SILVER';
-                     if(isSilver) await client.query(`UPDATE external_shops SET balance_silver = balance_silver - $1 WHERE id = $2`, [weight, shopId]);
-                     else await client.query(`UPDATE external_shops SET balance_gold = balance_gold - $1 WHERE id = $2`, [weight, shopId]);
+                     const col = isSilver ? 'balance_silver' : 'balance_gold';
+
+                     await client.query(`UPDATE external_shops SET ${col} = ${col} - $1 WHERE id = $2`, [weight, shopId]);
                      
                      await client.query("UPDATE inventory_items SET status='AVAILABLE' WHERE id=$1", [item.original_inventory_id]);
                  } else {
