@@ -23,31 +23,47 @@ router.get('/list', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. GET SHOP DETAILS (WITH AUTO-CORRECT & CASH FIX)
+// 3. GET SHOP DETAILS (FIXED: Two-Way Payment Aggregation)
 router.get('/:id', async (req, res) => {
   try {
     const shopId = req.params.id;
     const shopRes = await pool.query('SELECT * FROM external_shops WHERE id = $1', [shopId]);
     const transRes = await pool.query('SELECT * FROM shop_transactions WHERE shop_id = $1 ORDER BY created_at DESC', [shopId]);
     
-    // Aggregated payments per transaction
-    // FIX: Using CASE WHEN to prevent double counting cash when converted_metal_weight exists
+    // --- FIX: AGGREGATE PAYMENTS (Incoming + Outgoing Allocations) ---
+    // This query now counts a transaction as "Paid" if it was used to pay others (parent_txn_id)
     const paymentAggRes = await pool.query(`
-        SELECT transaction_id, 
-               SUM(COALESCE(gold_paid, 0) + COALESCE(converted_metal_weight, 0)) as total_gold_paid,
-               SUM(COALESCE(silver_paid, 0)) as total_silver_paid,
-               SUM(CASE WHEN COALESCE(converted_metal_weight, 0) <= 0 THEN COALESCE(cash_paid, 0) ELSE 0 END) as total_cash_paid
-        FROM shop_transaction_payments
-        GROUP BY transaction_id
+        SELECT txn_id as transaction_id, 
+               SUM(gold) as total_gold_paid,
+               SUM(silver) as total_silver_paid,
+               SUM(cash) as total_cash_paid
+        FROM (
+            -- 1. Direct Payments Received (Standard)
+            SELECT transaction_id as txn_id, 
+                   (COALESCE(gold_paid, 0) + COALESCE(converted_metal_weight, 0)) as gold,
+                   COALESCE(silver_paid, 0) as silver,
+                   (CASE WHEN COALESCE(converted_metal_weight, 0) <= 0 THEN COALESCE(cash_paid, 0) ELSE 0 END) as cash
+            FROM shop_transaction_payments
+            
+            UNION ALL
+            
+            -- 2. Allocations Used To Pay Others (Source Credit)
+            -- If this Txn (parent_txn_id) was used to pay another, count that amount as 'settled' for this Txn too.
+            SELECT parent_txn_id as txn_id,
+                   (COALESCE(gold_paid, 0) + COALESCE(converted_metal_weight, 0)) as gold,
+                   COALESCE(silver_paid, 0) as silver,
+                   (CASE WHEN COALESCE(converted_metal_weight, 0) <= 0 THEN COALESCE(cash_paid, 0) ELSE 0 END) as cash
+            FROM shop_transaction_payments
+            WHERE parent_txn_id IS NOT NULL
+        ) as combined_payments
+        GROUP BY txn_id
     `);
 
-    // Map payments using String keys to match IDs safely
     const paymentsMap = {};
     paymentAggRes.rows.forEach(p => { 
         paymentsMap[String(p.transaction_id)] = p; 
     });
 
-    // Attach payments to transactions with AUTO-CORRECT LOGIC
     const transactions = transRes.rows.map(t => {
         const payData = paymentsMap[String(t.id)];
         
@@ -58,22 +74,20 @@ router.get('/:id', async (req, res) => {
         const tGold = parseFloat(t.pure_weight) || 0;
         const tSilver = parseFloat(t.silver_weight) || 0;
 
-        // --- INTELLIGENT FIX ---
-        // If Item is Silver but payments are recorded as Gold (data mismatch), swap them.
-        if (tSilver > 0.005 && tGold <= 0.005) {
+        // --- INTELLIGENT BUCKET FIX (Retained) ---
+        if (tSilver > 0.01 && tGold < 0.01) {
              if (pGold > 0) {
                  pSilver += pGold; 
                  pGold = 0;
              }
         }
-        // If Item is Gold but payments are recorded as Silver, swap them.
-        else if (tGold > 0.005 && tSilver <= 0.005) {
+        else if (tGold > 0.01 && tSilver < 0.01) {
              if (pSilver > 0) {
                  pGold += pSilver;
                  pSilver = 0;
              }
         }
-        // -----------------------
+        // ------------------------------------------
 
         return {
             ...t,
@@ -83,7 +97,6 @@ router.get('/:id', async (req, res) => {
         };
     });
 
-    // Fetch Detailed Payment History
     const historyRes = await pool.query(`
         SELECT 
             p.id, p.created_at, p.payment_mode, 
@@ -121,20 +134,18 @@ router.get('/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. ADD TRANSACTION
+// 4. ADD TRANSACTION (Unchanged)
 router.post('/transaction', async (req, res) => {
   const { shop_id, action, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, transfer_cash, inventory_item_id, quantity } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // Trust Frontend Inputs
     let inputG = Math.abs(parseFloat(pure_weight) || 0);
     let inputS = Math.abs(parseFloat(silver_weight) || 0);
     let c_val = Math.abs(parseFloat(cash_amount) || 0);
     const lendQty = parseInt(quantity) || 1;
 
-    // Ledger Update
     const shouldUpdateLedger = (transfer_cash !== false); 
     if (c_val > 0.01 && shouldUpdateLedger) {
         let assetChange = 0;
@@ -155,7 +166,6 @@ router.post('/transaction', async (req, res) => {
       [inputG * multiplier, inputS * multiplier, c_val * multiplier, shop_id]
     );
 
-    // Inventory Update
     if (action === 'LEND_ADD' && inventory_item_id) {
         const itemRes = await client.query("SELECT * FROM inventory_items WHERE id = $1", [inventory_item_id]);
         if(itemRes.rows.length > 0) {
@@ -175,7 +185,6 @@ router.post('/transaction', async (req, res) => {
         }
     }
 
-    // Insert Transaction
     const txnRes = await client.query(
       `INSERT INTO shop_transactions (shop_id, type, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, is_settled, inventory_item_id, quantity)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE, $10, $11) RETURNING id`,
@@ -183,7 +192,6 @@ router.post('/transaction', async (req, res) => {
     );
     const parentTxnId = txnRes.rows[0].id;
 
-    // Auto-Allocation Logic
     let targetType = null;
     if (action === 'BORROW_REPAY' || action === 'LEND_ADD') targetType = 'BORROW_ADD';
     else if (action === 'BORROW_ADD' || action === 'LEND_COLLECT') targetType = 'LEND_ADD';
@@ -238,7 +246,6 @@ router.post('/transaction', async (req, res) => {
             }
         }
         
-        // Mark NEW Transaction as settled if fully used up
         if (availG <= 0.005 && availS <= 0.005 && availC <= 0.01) {
             await client.query('UPDATE shop_transactions SET is_settled = TRUE WHERE id = $1', [parentTxnId]);
         }
@@ -249,7 +256,7 @@ router.post('/transaction', async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// 5. DELETE TRANSACTION
+// 5. DELETE TRANSACTION (Unchanged)
 router.delete('/transaction/:id', async (req, res) => {
   const { id } = req.params;
   const client = await pool.connect();
@@ -260,7 +267,6 @@ router.delete('/transaction/:id', async (req, res) => {
     if (txnRes.rows.length === 0) throw new Error('Transaction not found');
     const txn = txnRes.rows[0];
 
-    // Restore Inventory
     if (txn.inventory_item_id && txn.type === 'LEND_ADD') {
         const itemRes = await client.query("SELECT * FROM inventory_items WHERE id = $1", [txn.inventory_item_id]);
         if (itemRes.rows.length > 0) {
@@ -289,9 +295,7 @@ router.delete('/transaction/:id', async (req, res) => {
         }
     }
 
-    // Reverse Cash in Ledger
     const c_val = parseFloat(txn.cash_amount) || 0;
-    const desc = (txn.description || '').toLowerCase();
     
     if (c_val > 0.01) {
         let assetReversal = 0;
@@ -303,7 +307,6 @@ router.delete('/transaction/:id', async (req, res) => {
         }
     }
 
-    // Reverse Shop Balance
     let g = parseFloat(txn.pure_weight) || 0;
     let s = parseFloat(txn.silver_weight) || 0;
     let c = parseFloat(txn.cash_amount) || 0;
@@ -324,7 +327,6 @@ router.delete('/transaction/:id', async (req, res) => {
       [g * multiplier, s * multiplier, c * multiplier, txn.shop_id]
     );
 
-    // Clean up payments
     const pRes = await client.query(`SELECT transaction_id FROM shop_transaction_payments WHERE parent_txn_id = $1`, [id]);
     if (pRes.rows.length > 0) {
         const ids = pRes.rows.map(r => r.transaction_id);
@@ -338,7 +340,7 @@ router.delete('/transaction/:id', async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// 6. UPDATE TRANSACTION
+// 6. UPDATE TRANSACTION (Retained Payment Migration Fix)
 router.put('/transaction/:id', async (req, res) => {
   const { id } = req.params;
   const { description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount } = req.body;
@@ -350,7 +352,7 @@ router.put('/transaction/:id', async (req, res) => {
     if(oldRes.rows.length === 0) throw new Error("Transaction not found");
     const oldTxn = oldRes.rows[0];
 
-    // 1. REVERT OLD IMPACT (Shop Balance)
+    // 1. REVERT OLD IMPACT
     let oldRevertMult = (oldTxn.type === 'BORROW_REPAY' || oldTxn.type === 'LEND_ADD') ? 1 : -1;
     
     await client.query(
@@ -358,7 +360,6 @@ router.put('/transaction/:id', async (req, res) => {
         [parseFloat(oldTxn.pure_weight)*oldRevertMult, parseFloat(oldTxn.silver_weight)*oldRevertMult, parseFloat(oldTxn.cash_amount)*oldRevertMult, oldTxn.shop_id]
     );
 
-    // 2. REVERT OLD IMPACT (Cash Ledger/Assets)
     const oldCash = parseFloat(oldTxn.cash_amount) || 0;
     if (oldCash > 0.01) {
         let revertAsset = 0;
@@ -370,11 +371,20 @@ router.put('/transaction/:id', async (req, res) => {
         }
     }
 
-    // 3. UPDATE TRANSACTION DATA
+    // 2. UPDATE TRANSACTION
     await client.query(`UPDATE shop_transactions SET description=$1, gross_weight=$2, wastage_percent=$3, making_charges=$4, pure_weight=$5, silver_weight=$6, cash_amount=$7 WHERE id=$8`,
       [description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, id]);
 
-    // 4. APPLY NEW IMPACT (Shop Balance)
+    // 3. PAYMENT MIGRATION FIX
+    const newG = parseFloat(pure_weight) || 0;
+    const newS = parseFloat(silver_weight) || 0;
+    if (newS > 0.01 && newG < 0.01) {
+         await client.query(`UPDATE shop_transaction_payments SET silver_paid = silver_paid + gold_paid, gold_paid = 0 WHERE transaction_id = $1`, [id]);
+    } else if (newG > 0.01 && newS < 0.01) {
+         await client.query(`UPDATE shop_transaction_payments SET gold_paid = gold_paid + silver_paid, silver_paid = 0 WHERE transaction_id = $1`, [id]);
+    }
+
+    // 4. APPLY NEW IMPACT
     let newApplyMult = (oldTxn.type === 'BORROW_REPAY' || oldTxn.type === 'LEND_ADD') ? -1 : 1;
     
     await client.query(
@@ -382,7 +392,6 @@ router.put('/transaction/:id', async (req, res) => {
         [parseFloat(pure_weight)*newApplyMult, parseFloat(silver_weight)*newApplyMult, parseFloat(cash_amount)*newApplyMult, oldTxn.shop_id]
     );
 
-    // 5. APPLY NEW IMPACT (Cash Ledger/Assets)
     const newCash = parseFloat(cash_amount) || 0;
     if (newCash > 0.01) {
         let applyAsset = 0;
@@ -399,7 +408,7 @@ router.put('/transaction/:id', async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// 7. SETTLE ITEM
+// 7. SETTLE ITEM (Unchanged)
 router.post('/settle-item', async (req, res) => {
     const { transaction_id, shop_id, payment_mode, gold_val, silver_val, cash_val, metal_rate, converted_weight } = req.body;
     const client = await pool.connect();
@@ -431,7 +440,6 @@ router.post('/settle-item', async (req, res) => {
         await client.query(`UPDATE external_shops SET balance_gold=balance_gold+$1, balance_silver=balance_silver+$2, balance_cash=balance_cash+$3 WHERE id=$4`, 
             [g*mult, s*mult, c*mult, shop_id]);
         
-        // Check Settlement
         const sumRes = await client.query(`
             SELECT t.pure_weight, t.silver_weight, t.cash_amount,
                    SUM(COALESCE(p.gold_paid,0) + COALESCE(p.converted_metal_weight,0)) as paid_gold,
@@ -453,7 +461,7 @@ router.post('/settle-item', async (req, res) => {
     } catch(err) { await client.query('ROLLBACK'); res.status(500).json({error:err.message}); } finally { client.release(); }
 });
 
-// 8. DELETE SHOP
+// 8. DELETE SHOP (Unchanged)
 router.delete('/:id', async (req, res) => {
     const { id } = req.params;
     const client = await pool.connect();
