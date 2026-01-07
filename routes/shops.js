@@ -23,7 +23,7 @@ router.get('/list', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. GET SHOP DETAILS
+// 3. GET SHOP DETAILS (WITH AUTO-CORRECT & CASH FIX)
 router.get('/:id', async (req, res) => {
   try {
     const shopId = req.params.id;
@@ -31,6 +31,7 @@ router.get('/:id', async (req, res) => {
     const transRes = await pool.query('SELECT * FROM shop_transactions WHERE shop_id = $1 ORDER BY created_at DESC', [shopId]);
     
     // Aggregated payments per transaction
+    // FIX: Using CASE WHEN to prevent double counting cash when converted_metal_weight exists
     const paymentAggRes = await pool.query(`
         SELECT transaction_id, 
                SUM(COALESCE(gold_paid, 0) + COALESCE(converted_metal_weight, 0)) as total_gold_paid,
@@ -40,20 +41,45 @@ router.get('/:id', async (req, res) => {
         GROUP BY transaction_id
     `);
 
-    // Create a map using String keys to prevent type mismatch
+    // Map payments using String keys to match IDs safely
     const paymentsMap = {};
     paymentAggRes.rows.forEach(p => { 
         paymentsMap[String(p.transaction_id)] = p; 
     });
 
-    // Attach payments to transactions
+    // Attach payments to transactions with AUTO-CORRECT LOGIC
     const transactions = transRes.rows.map(t => {
         const payData = paymentsMap[String(t.id)];
+        
+        let pGold = parseFloat(payData?.total_gold_paid || 0);
+        let pSilver = parseFloat(payData?.total_silver_paid || 0);
+        const pCash = parseFloat(payData?.total_cash_paid || 0);
+
+        const tGold = parseFloat(t.pure_weight) || 0;
+        const tSilver = parseFloat(t.silver_weight) || 0;
+
+        // --- INTELLIGENT FIX ---
+        // If Item is Silver but payments are recorded as Gold (data mismatch), swap them.
+        if (tSilver > 0.005 && tGold <= 0.005) {
+             if (pGold > 0) {
+                 pSilver += pGold; 
+                 pGold = 0;
+             }
+        }
+        // If Item is Gold but payments are recorded as Silver, swap them.
+        else if (tGold > 0.005 && tSilver <= 0.005) {
+             if (pSilver > 0) {
+                 pGold += pSilver;
+                 pSilver = 0;
+             }
+        }
+        // -----------------------
+
         return {
             ...t,
-            total_gold_paid: parseFloat(payData?.total_gold_paid || 0),
-            total_silver_paid: parseFloat(payData?.total_silver_paid || 0),
-            total_cash_paid: parseFloat(payData?.total_cash_paid || 0)
+            total_gold_paid: pGold,
+            total_silver_paid: pSilver,
+            total_cash_paid: pCash
         };
     });
 
@@ -95,14 +121,14 @@ router.get('/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. ADD TRANSACTION (TRUSTS FRONTEND INPUT)
+// 4. ADD TRANSACTION
 router.post('/transaction', async (req, res) => {
   const { shop_id, action, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, transfer_cash, inventory_item_id, quantity } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // STRICTLY TRUST FRONTEND INPUTS for Gold/Silver buckets
+    // Trust Frontend Inputs
     let inputG = Math.abs(parseFloat(pure_weight) || 0);
     let inputS = Math.abs(parseFloat(silver_weight) || 0);
     let c_val = Math.abs(parseFloat(cash_amount) || 0);
@@ -266,9 +292,8 @@ router.delete('/transaction/:id', async (req, res) => {
     // Reverse Cash in Ledger
     const c_val = parseFloat(txn.cash_amount) || 0;
     const desc = (txn.description || '').toLowerCase();
-    const isLikelyMC = desc.includes('item') || desc.includes('sold') || desc.includes('mc');
     
-    if (c_val > 0.01 && !isLikelyMC) {
+    if (c_val > 0.01) {
         let assetReversal = 0;
         if (txn.type === 'BORROW_ADD' || txn.type === 'LEND_COLLECT') assetReversal = -c_val;
         else if (txn.type === 'LEND_ADD' || txn.type === 'BORROW_REPAY') assetReversal = c_val;
@@ -313,7 +338,7 @@ router.delete('/transaction/:id', async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// 6. UPDATE TRANSACTION (NOW WITH SMART PAYMENT MIGRATION)
+// 6. UPDATE TRANSACTION
 router.put('/transaction/:id', async (req, res) => {
   const { id } = req.params;
   const { description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount } = req.body;
@@ -348,25 +373,6 @@ router.put('/transaction/:id', async (req, res) => {
     // 3. UPDATE TRANSACTION DATA
     await client.query(`UPDATE shop_transactions SET description=$1, gross_weight=$2, wastage_percent=$3, making_charges=$4, pure_weight=$5, silver_weight=$6, cash_amount=$7 WHERE id=$8`,
       [description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, id]);
-
-    // --- SMART MIGRATION: Fix Payment History if Metal Type Switched ---
-    // Case A: Switched from Gold to Silver (Pure became 0, Silver became >0)
-    if (parseFloat(oldTxn.pure_weight) > 0.005 && parseFloat(pure_weight) <= 0.005 && parseFloat(silver_weight) > 0.005) {
-        await client.query(`
-            UPDATE shop_transaction_payments 
-            SET silver_paid = silver_paid + gold_paid, gold_paid = 0 
-            WHERE transaction_id = $1
-        `, [id]);
-    }
-    // Case B: Switched from Silver to Gold (Silver became 0, Pure became >0)
-    else if (parseFloat(oldTxn.silver_weight) > 0.005 && parseFloat(silver_weight) <= 0.005 && parseFloat(pure_weight) > 0.005) {
-        await client.query(`
-            UPDATE shop_transaction_payments 
-            SET gold_paid = gold_paid + silver_paid, silver_paid = 0 
-            WHERE transaction_id = $1
-        `, [id]);
-    }
-    // ------------------------------------------------------------------
 
     // 4. APPLY NEW IMPACT (Shop Balance)
     let newApplyMult = (oldTxn.type === 'BORROW_REPAY' || oldTxn.type === 'LEND_ADD') ? -1 : 1;
