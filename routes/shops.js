@@ -23,14 +23,14 @@ router.get('/list', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. GET SHOP DETAILS (ENHANCED FOR HISTORY & PENDING CALC)
+// 3. GET SHOP DETAILS
 router.get('/:id', async (req, res) => {
   try {
     const shopId = req.params.id;
     const shopRes = await pool.query('SELECT * FROM external_shops WHERE id = $1', [shopId]);
     const transRes = await pool.query('SELECT * FROM shop_transactions WHERE shop_id = $1 ORDER BY created_at DESC', [shopId]);
     
-    // 1. Fetch aggregated payments per item (For Top Tables - Pending Calc)
+    // Fetch aggregated payments per item
     const paymentAggRes = await pool.query(`
         SELECT transaction_id, 
                SUM(COALESCE(gold_paid, 0) + COALESCE(converted_metal_weight, 0)) as total_gold_paid,
@@ -43,7 +43,7 @@ router.get('/:id', async (req, res) => {
     const paymentsMap = {};
     paymentAggRes.rows.forEach(p => { paymentsMap[p.transaction_id] = p; });
 
-    // Attach payments to transactions for the "Pending" calculation in top tables
+    // Attach payments to transactions
     const transactions = transRes.rows.map(t => ({
         ...t,
         total_gold_paid: parseFloat(paymentsMap[t.id]?.total_gold_paid || 0),
@@ -51,7 +51,7 @@ router.get('/:id', async (req, res) => {
         total_cash_paid: parseFloat(paymentsMap[t.id]?.total_cash_paid || 0)
     }));
 
-    // 2. Fetch Detailed Payment History (For Bottom Table - Unified History)
+    // Fetch Detailed Payment History
     const historyRes = await pool.query(`
         SELECT 
             p.id, p.created_at, p.payment_mode, 
@@ -64,13 +64,13 @@ router.get('/:id', async (req, res) => {
         ORDER BY p.created_at DESC
     `, [shopId]);
 
-    // Combine standard transactions and payment records into one timeline
+    // Combine standard transactions and payment records
     const fullHistory = [
         ...transactions.map(t => ({ ...t, kind: 'TXN' })), 
         ...historyRes.rows.map(p => ({
-            id: `PAY-${p.id}`, // Unique ID for key
+            id: `PAY-${p.id}`, 
             created_at: p.created_at,
-            type: 'SETTLEMENT', // Visual Tag
+            type: 'SETTLEMENT', 
             description: `Paid for: ${p.item_desc} (Ref #${p.parent_id})`,
             pure_weight: p.gold_paid,
             silver_weight: p.silver_paid,
@@ -79,13 +79,12 @@ router.get('/:id', async (req, res) => {
         }))
     ];
 
-    // Sort combined history by date DESC
     fullHistory.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
     res.json({ 
         shop: shopRes.rows[0], 
-        transactions: transactions, // For Top Tables (Borrow/Lend)
-        full_history: fullHistory   // For Bottom Table (Audit Trail)
+        transactions: transactions, 
+        full_history: fullHistory
     });
 
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -103,25 +102,23 @@ router.post('/transaction', async (req, res) => {
     let c_val = Math.abs(parseFloat(cash_amount) || 0);
     const lendQty = parseInt(quantity) || 1;
 
-    // === BROADER METAL CHECK ===
+    // Metal Type Check
     if (inventory_item_id) {
         const itemCheck = await client.query("SELECT metal_type FROM inventory_items WHERE id = $1", [inventory_item_id]);
         if (itemCheck.rows.length > 0) {
             const dbMetal = (itemCheck.rows[0].metal_type || '').toUpperCase();
             const totalPure = inputG + inputS; 
-
-            // Matches "SILVER", "AG", "925", "STERLING", "STG"
-            if (dbMetal.includes('SILVER') || dbMetal.includes('AG') || dbMetal.includes('925') || dbMetal.includes('STERLING') || dbMetal.includes('STG')) {
-                inputS = totalPure; // Force into Silver
-                inputG = 0;         // Clear Gold
+            if (dbMetal.includes('SILVER') || dbMetal.includes('AG') || dbMetal.includes('925') || dbMetal.includes('STERLING')) {
+                inputS = totalPure; 
+                inputG = 0;         
             } else {
-                inputG = totalPure; // Force into Gold
-                inputS = 0;         // Clear Silver
+                inputG = totalPure; 
+                inputS = 0;         
             }
         }
     }
 
-    // ... (Ledger and Balance Updates) ...
+    // Ledger Update
     const shouldUpdateLedger = (transfer_cash !== false); 
     if (c_val > 0.01 && shouldUpdateLedger) {
         let assetChange = 0;
@@ -142,7 +139,7 @@ router.post('/transaction', async (req, res) => {
       [inputG * multiplier, inputS * multiplier, c_val * multiplier, shop_id]
     );
 
-    // ... (Inventory Status Update) ...
+    // Inventory Update
     if (action === 'LEND_ADD' && inventory_item_id) {
         const itemRes = await client.query("SELECT * FROM inventory_items WHERE id = $1", [inventory_item_id]);
         if(itemRes.rows.length > 0) {
@@ -162,7 +159,7 @@ router.post('/transaction', async (req, res) => {
         }
     }
 
-    // ... (Transaction Insert) ...
+    // Insert Transaction
     const txnRes = await client.query(
       `INSERT INTO shop_transactions (shop_id, type, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, is_settled, inventory_item_id, quantity)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE, $10, $11) RETURNING id`,
@@ -170,7 +167,7 @@ router.post('/transaction', async (req, res) => {
     );
     const parentTxnId = txnRes.rows[0].id;
 
-    // ... (FIFO Allocation Logic) ...
+    // Auto-Allocation Logic
     let targetType = null;
     if (action === 'BORROW_REPAY' || action === 'LEND_ADD') targetType = 'BORROW_ADD';
     else if (action === 'BORROW_ADD' || action === 'LEND_COLLECT') targetType = 'LEND_ADD';
@@ -247,6 +244,7 @@ router.delete('/transaction/:id', async (req, res) => {
     if (txnRes.rows.length === 0) throw new Error('Transaction not found');
     const txn = txnRes.rows[0];
 
+    // Restore Inventory
     if (txn.inventory_item_id && txn.type === 'LEND_ADD') {
         const itemRes = await client.query("SELECT * FROM inventory_items WHERE id = $1", [txn.inventory_item_id]);
         if (itemRes.rows.length > 0) {
@@ -275,6 +273,7 @@ router.delete('/transaction/:id', async (req, res) => {
         }
     }
 
+    // Reverse Cash in Ledger
     const c_val = parseFloat(txn.cash_amount) || 0;
     const desc = (txn.description || '').toLowerCase();
     const isLikelyMC = desc.includes('item') || desc.includes('sold') || desc.includes('mc');
@@ -289,6 +288,7 @@ router.delete('/transaction/:id', async (req, res) => {
         }
     }
 
+    // Reverse Shop Balance
     let g = parseFloat(txn.pure_weight) || 0;
     let s = parseFloat(txn.silver_weight) || 0;
     let c = parseFloat(txn.cash_amount) || 0;
@@ -309,6 +309,7 @@ router.delete('/transaction/:id', async (req, res) => {
       [g * multiplier, s * multiplier, c * multiplier, txn.shop_id]
     );
 
+    // Clean up payments
     const pRes = await client.query(`SELECT transaction_id FROM shop_transaction_payments WHERE parent_txn_id = $1`, [id]);
     if (pRes.rows.length > 0) {
         const ids = pRes.rows.map(r => r.transaction_id);
@@ -322,30 +323,66 @@ router.delete('/transaction/:id', async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// 6. UPDATE TRANSACTION
+// 6. UPDATE TRANSACTION (NOW HANDLES LEDGER & METAL TYPES)
 router.put('/transaction/:id', async (req, res) => {
   const { id } = req.params;
   const { description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    
     const oldRes = await client.query('SELECT * FROM shop_transactions WHERE id = $1', [id]);
+    if(oldRes.rows.length === 0) throw new Error("Transaction not found");
     const oldTxn = oldRes.rows[0];
 
-    let om = (oldTxn.type === 'BORROW_REPAY' || oldTxn.type === 'LEND_ADD') ? 1 : -1;
+    // 1. REVERT OLD IMPACT (Shop Balance)
+    // 'BORROW_REPAY' / 'LEND_ADD' = multiplier -1 (originally). Revert = 1.
+    // 'BORROW_ADD' / 'LEND_COLLECT' = multiplier 1 (originally). Revert = -1.
+    let oldRevertMult = (oldTxn.type === 'BORROW_REPAY' || oldTxn.type === 'LEND_ADD') ? 1 : -1;
+    
     await client.query(
         `UPDATE external_shops SET balance_gold=balance_gold+$1, balance_silver=balance_silver+$2, balance_cash=balance_cash+$3 WHERE id=$4`, 
-        [parseFloat(oldTxn.pure_weight)*om, parseFloat(oldTxn.silver_weight)*om, parseFloat(oldTxn.cash_amount)*om, oldTxn.shop_id]
+        [parseFloat(oldTxn.pure_weight)*oldRevertMult, parseFloat(oldTxn.silver_weight)*oldRevertMult, parseFloat(oldTxn.cash_amount)*oldRevertMult, oldTxn.shop_id]
     );
 
+    // 2. REVERT OLD IMPACT (Cash Ledger/Assets)
+    const oldCash = parseFloat(oldTxn.cash_amount) || 0;
+    if (oldCash > 0.01) {
+        let revertAsset = 0;
+        // Logic must be opposite of POST
+        // In POST: BORROW_ADD = +Cash (IN). Revert = -Cash.
+        // In POST: LEND_ADD = -Cash (OUT). Revert = +Cash.
+        if (oldTxn.type === 'BORROW_ADD' || oldTxn.type === 'LEND_COLLECT') revertAsset = -oldCash;
+        else if (oldTxn.type === 'LEND_ADD' || oldTxn.type === 'BORROW_REPAY') revertAsset = oldCash;
+
+        if (revertAsset !== 0) {
+            await client.query(`UPDATE shop_assets SET cash_balance = cash_balance + $1 WHERE id = 1`, [revertAsset]);
+        }
+    }
+
+    // 3. UPDATE TRANSACTION DATA
     await client.query(`UPDATE shop_transactions SET description=$1, gross_weight=$2, wastage_percent=$3, making_charges=$4, pure_weight=$5, silver_weight=$6, cash_amount=$7 WHERE id=$8`,
       [description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, id]);
 
-    let nm = (oldTxn.type === 'BORROW_REPAY' || oldTxn.type === 'LEND_ADD') ? -1 : 1;
+    // 4. APPLY NEW IMPACT (Shop Balance)
+    let newApplyMult = (oldTxn.type === 'BORROW_REPAY' || oldTxn.type === 'LEND_ADD') ? -1 : 1;
+    
     await client.query(
         `UPDATE external_shops SET balance_gold=balance_gold+$1, balance_silver=balance_silver+$2, balance_cash=balance_cash+$3 WHERE id=$4`, 
-        [parseFloat(pure_weight)*nm, parseFloat(silver_weight)*nm, parseFloat(cash_amount)*nm, oldTxn.shop_id]
+        [parseFloat(pure_weight)*newApplyMult, parseFloat(silver_weight)*newApplyMult, parseFloat(cash_amount)*newApplyMult, oldTxn.shop_id]
     );
+
+    // 5. APPLY NEW IMPACT (Cash Ledger/Assets)
+    const newCash = parseFloat(cash_amount) || 0;
+    if (newCash > 0.01) {
+        let applyAsset = 0;
+        if (oldTxn.type === 'BORROW_ADD' || oldTxn.type === 'LEND_COLLECT') applyAsset = newCash;
+        else if (oldTxn.type === 'LEND_ADD' || oldTxn.type === 'BORROW_REPAY') applyAsset = -newCash;
+
+        if (applyAsset !== 0) {
+            await client.query(`UPDATE shop_assets SET cash_balance = cash_balance + $1 WHERE id = 1`, [applyAsset]);
+        }
+    }
 
     await client.query('COMMIT');
     res.json({ success: true });
@@ -359,21 +396,19 @@ router.post('/settle-item', async (req, res) => {
     try {
         await client.query('BEGIN');
         
-        // 1. Record Payment
         await client.query(
             `INSERT INTO shop_transaction_payments (transaction_id, payment_mode, gold_paid, silver_paid, cash_paid, metal_rate, converted_metal_weight) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
             [transaction_id, payment_mode, gold_val||0, silver_val||0, cash_val||0, metal_rate||0, converted_weight||0]
         );
         
-        // 2. Adjust Assets & Shop Balance
         const tRes = await client.query('SELECT type FROM shop_transactions WHERE id=$1', [transaction_id]);
         const type = tRes.rows[0].type;
         const safeCash = parseFloat(cash_val) || 0;
         
         if (safeCash > 0.01) {
             let assetChange = 0;
-            if (type === 'BORROW_ADD') assetChange = -safeCash; // We paid cash out
-            else if (type === 'LEND_ADD') assetChange = safeCash; // We collected cash
+            if (type === 'BORROW_ADD') assetChange = -safeCash; 
+            else if (type === 'LEND_ADD') assetChange = safeCash; 
             if (assetChange !== 0) await client.query(`UPDATE shop_assets SET cash_balance = cash_balance + $1 WHERE id = 1`, [assetChange]);
         }
 
@@ -381,12 +416,12 @@ router.post('/settle-item', async (req, res) => {
         let s = parseFloat(silver_val)||0;
         let c = parseFloat(cash_val)||0;
 
-        let mult = (type === 'BORROW_ADD') ? -1 : 1; // Reduce debt or credit
+        let mult = (type === 'BORROW_ADD') ? -1 : 1; 
 
         await client.query(`UPDATE external_shops SET balance_gold=balance_gold+$1, balance_silver=balance_silver+$2, balance_cash=balance_cash+$3 WHERE id=$4`, 
             [g*mult, s*mult, c*mult, shop_id]);
         
-        // 3. Check for Full Settlement
+        // Check Settlement
         const sumRes = await client.query(`
             SELECT t.pure_weight, t.silver_weight, t.cash_amount,
                    SUM(COALESCE(p.gold_paid,0) + COALESCE(p.converted_metal_weight,0)) as paid_gold,

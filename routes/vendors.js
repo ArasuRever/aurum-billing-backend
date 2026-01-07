@@ -224,7 +224,64 @@ router.get('/:id/sales-history', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 13. SOFT DELETE VENDOR (WITH STOCK ACTION)
+// 13. UPDATE SOLD/LENT HISTORY ITEM
+router.put('/update-sale-history/:id', async (req, res) => {
+  const { id } = req.params; // sale_item.id (SOLD) or shop_transactions.id (LENT)
+  const { type, item_name, gross_weight, wastage_percent, sold_rate, total_amount } = req.body;
+  
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    if (type === 'SOLD') {
+      // 1. Get the inventory item ID linked to this sale item
+      const siRes = await client.query('SELECT item_id FROM sale_items WHERE id = $1', [id]);
+      if (siRes.rows.length === 0) throw new Error('Sale item not found');
+      const itemId = siRes.rows[0].item_id;
+
+      // 2. Update Inventory Item (Name, Touch) for record keeping
+      await client.query(
+        'UPDATE inventory_items SET item_name = $1, wastage_percent = $2 WHERE id = $3',
+        [item_name, wastage_percent, itemId]
+      );
+
+      // 3. Update Sale Item (Weight, Rate, Price)
+      await client.query(
+        'UPDATE sale_items SET sold_weight = $1, sold_rate = $2, total_item_price = $3 WHERE id = $4',
+        [gross_weight, sold_rate, total_amount, id]
+      );
+
+    } else if (type === 'LENT') {
+      // 1. Get inventory item ID linked to this transaction
+      const stRes = await client.query('SELECT inventory_item_id FROM shop_transactions WHERE id = $1', [id]);
+      if (stRes.rows.length === 0) throw new Error('Transaction not found');
+      const itemId = stRes.rows[0].inventory_item_id;
+
+      // 2. Update Inventory Item (Name, Touch)
+      await client.query(
+        'UPDATE inventory_items SET item_name = $1, wastage_percent = $2 WHERE id = $3',
+        [item_name, wastage_percent, itemId]
+      );
+
+      // 3. Update Transaction (Weight)
+      // LENT items use 'gross_weight' in shop_transactions
+      await client.query(
+        'UPDATE shop_transactions SET gross_weight = $1, description = $2 WHERE id = $3',
+        [gross_weight, item_name, id]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true, message: "History item updated successfully" });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// 14. SOFT DELETE VENDOR (WITH STOCK ACTION)
 router.delete('/:id', async (req, res) => {
     const { id } = req.params;
     const { stock_action } = req.query; // 'DELETE' or 'MOVE'
