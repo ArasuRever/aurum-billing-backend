@@ -30,26 +30,32 @@ router.get('/:id', async (req, res) => {
     const shopRes = await pool.query('SELECT * FROM external_shops WHERE id = $1', [shopId]);
     const transRes = await pool.query('SELECT * FROM shop_transactions WHERE shop_id = $1 ORDER BY created_at DESC', [shopId]);
     
-    // Fetch aggregated payments per item
+    // Aggregated payments per transaction
     const paymentAggRes = await pool.query(`
         SELECT transaction_id, 
                SUM(COALESCE(gold_paid, 0) + COALESCE(converted_metal_weight, 0)) as total_gold_paid,
                SUM(COALESCE(silver_paid, 0)) as total_silver_paid,
-               SUM(COALESCE(cash_paid, 0)) as total_cash_paid
+               SUM(CASE WHEN COALESCE(converted_metal_weight, 0) <= 0 THEN COALESCE(cash_paid, 0) ELSE 0 END) as total_cash_paid
         FROM shop_transaction_payments
         GROUP BY transaction_id
     `);
 
+    // Create a map using String keys to prevent type mismatch
     const paymentsMap = {};
-    paymentAggRes.rows.forEach(p => { paymentsMap[p.transaction_id] = p; });
+    paymentAggRes.rows.forEach(p => { 
+        paymentsMap[String(p.transaction_id)] = p; 
+    });
 
     // Attach payments to transactions
-    const transactions = transRes.rows.map(t => ({
-        ...t,
-        total_gold_paid: parseFloat(paymentsMap[t.id]?.total_gold_paid || 0),
-        total_silver_paid: parseFloat(paymentsMap[t.id]?.total_silver_paid || 0),
-        total_cash_paid: parseFloat(paymentsMap[t.id]?.total_cash_paid || 0)
-    }));
+    const transactions = transRes.rows.map(t => {
+        const payData = paymentsMap[String(t.id)];
+        return {
+            ...t,
+            total_gold_paid: parseFloat(payData?.total_gold_paid || 0),
+            total_silver_paid: parseFloat(payData?.total_silver_paid || 0),
+            total_cash_paid: parseFloat(payData?.total_cash_paid || 0)
+        };
+    });
 
     // Fetch Detailed Payment History
     const historyRes = await pool.query(`
@@ -64,7 +70,6 @@ router.get('/:id', async (req, res) => {
         ORDER BY p.created_at DESC
     `, [shopId]);
 
-    // Combine standard transactions and payment records
     const fullHistory = [
         ...transactions.map(t => ({ ...t, kind: 'TXN' })), 
         ...historyRes.rows.map(p => ({
@@ -90,33 +95,18 @@ router.get('/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. ADD TRANSACTION
+// 4. ADD TRANSACTION (TRUSTS FRONTEND INPUT)
 router.post('/transaction', async (req, res) => {
   const { shop_id, action, description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, transfer_cash, inventory_item_id, quantity } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
+    // STRICTLY TRUST FRONTEND INPUTS for Gold/Silver buckets
     let inputG = Math.abs(parseFloat(pure_weight) || 0);
     let inputS = Math.abs(parseFloat(silver_weight) || 0);
     let c_val = Math.abs(parseFloat(cash_amount) || 0);
     const lendQty = parseInt(quantity) || 1;
-
-    // Metal Type Check
-    if (inventory_item_id) {
-        const itemCheck = await client.query("SELECT metal_type FROM inventory_items WHERE id = $1", [inventory_item_id]);
-        if (itemCheck.rows.length > 0) {
-            const dbMetal = (itemCheck.rows[0].metal_type || '').toUpperCase();
-            const totalPure = inputG + inputS; 
-            if (dbMetal.includes('SILVER') || dbMetal.includes('AG') || dbMetal.includes('925') || dbMetal.includes('STERLING')) {
-                inputS = totalPure; 
-                inputG = 0;         
-            } else {
-                inputG = totalPure; 
-                inputS = 0;         
-            }
-        }
-    }
 
     // Ledger Update
     const shouldUpdateLedger = (transfer_cash !== false); 
@@ -323,7 +313,7 @@ router.delete('/transaction/:id', async (req, res) => {
   } catch (err) { await client.query('ROLLBACK'); res.status(500).json({ error: err.message }); } finally { client.release(); }
 });
 
-// 6. UPDATE TRANSACTION (NOW HANDLES LEDGER & METAL TYPES)
+// 6. UPDATE TRANSACTION (NOW WITH SMART PAYMENT MIGRATION)
 router.put('/transaction/:id', async (req, res) => {
   const { id } = req.params;
   const { description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount } = req.body;
@@ -336,8 +326,6 @@ router.put('/transaction/:id', async (req, res) => {
     const oldTxn = oldRes.rows[0];
 
     // 1. REVERT OLD IMPACT (Shop Balance)
-    // 'BORROW_REPAY' / 'LEND_ADD' = multiplier -1 (originally). Revert = 1.
-    // 'BORROW_ADD' / 'LEND_COLLECT' = multiplier 1 (originally). Revert = -1.
     let oldRevertMult = (oldTxn.type === 'BORROW_REPAY' || oldTxn.type === 'LEND_ADD') ? 1 : -1;
     
     await client.query(
@@ -349,9 +337,6 @@ router.put('/transaction/:id', async (req, res) => {
     const oldCash = parseFloat(oldTxn.cash_amount) || 0;
     if (oldCash > 0.01) {
         let revertAsset = 0;
-        // Logic must be opposite of POST
-        // In POST: BORROW_ADD = +Cash (IN). Revert = -Cash.
-        // In POST: LEND_ADD = -Cash (OUT). Revert = +Cash.
         if (oldTxn.type === 'BORROW_ADD' || oldTxn.type === 'LEND_COLLECT') revertAsset = -oldCash;
         else if (oldTxn.type === 'LEND_ADD' || oldTxn.type === 'BORROW_REPAY') revertAsset = oldCash;
 
@@ -363,6 +348,25 @@ router.put('/transaction/:id', async (req, res) => {
     // 3. UPDATE TRANSACTION DATA
     await client.query(`UPDATE shop_transactions SET description=$1, gross_weight=$2, wastage_percent=$3, making_charges=$4, pure_weight=$5, silver_weight=$6, cash_amount=$7 WHERE id=$8`,
       [description, gross_weight, wastage_percent, making_charges, pure_weight, silver_weight, cash_amount, id]);
+
+    // --- SMART MIGRATION: Fix Payment History if Metal Type Switched ---
+    // Case A: Switched from Gold to Silver (Pure became 0, Silver became >0)
+    if (parseFloat(oldTxn.pure_weight) > 0.005 && parseFloat(pure_weight) <= 0.005 && parseFloat(silver_weight) > 0.005) {
+        await client.query(`
+            UPDATE shop_transaction_payments 
+            SET silver_paid = silver_paid + gold_paid, gold_paid = 0 
+            WHERE transaction_id = $1
+        `, [id]);
+    }
+    // Case B: Switched from Silver to Gold (Silver became 0, Pure became >0)
+    else if (parseFloat(oldTxn.silver_weight) > 0.005 && parseFloat(silver_weight) <= 0.005 && parseFloat(pure_weight) > 0.005) {
+        await client.query(`
+            UPDATE shop_transaction_payments 
+            SET gold_paid = gold_paid + silver_paid, silver_paid = 0 
+            WHERE transaction_id = $1
+        `, [id]);
+    }
+    // ------------------------------------------------------------------
 
     // 4. APPLY NEW IMPACT (Shop Balance)
     let newApplyMult = (oldTxn.type === 'BORROW_REPAY' || oldTxn.type === 'LEND_ADD') ? -1 : 1;
@@ -426,7 +430,7 @@ router.post('/settle-item', async (req, res) => {
             SELECT t.pure_weight, t.silver_weight, t.cash_amount,
                    SUM(COALESCE(p.gold_paid,0) + COALESCE(p.converted_metal_weight,0)) as paid_gold,
                    SUM(COALESCE(p.silver_paid,0)) as paid_silver,
-                   SUM(COALESCE(p.cash_paid,0)) as paid_cash
+                   SUM(CASE WHEN COALESCE(p.converted_metal_weight, 0) <= 0 THEN COALESCE(p.cash_paid, 0) ELSE 0 END) as paid_cash
             FROM shop_transactions t 
             LEFT JOIN shop_transaction_payments p ON t.id = p.transaction_id
             WHERE t.id = $1 GROUP BY t.id`, [transaction_id]);
