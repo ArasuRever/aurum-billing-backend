@@ -89,21 +89,13 @@ router.post('/add', upload.single('item_image'), async (req, res) => {
   }
 });
 
-// 2. BATCH ADD STOCK
 router.post('/batch-add', async (req, res) => {
   const { vendor_id, metal_type, invoice_no, items } = req.body; 
-  
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // --- FIX START: Handle 'OWN' vendor_id ---
-    let finalVendorId = vendor_id;
-    if (finalVendorId === 'OWN' || finalVendorId === '') {
-        finalVendorId = null;
-    }
-    // --- FIX END ---
-
+    let finalVendorId = (vendor_id === 'OWN' || vendor_id === '') ? null : vendor_id;
     let totalGross = 0;
     let totalPure = 0;
     
@@ -113,27 +105,28 @@ router.post('/batch-add', async (req, res) => {
         const mc = parseFloat(i.making_charges) || 0; 
         const pure = i.pure_weight ? parseFloat(i.pure_weight) : (g * (p/100));
         const qty = parseInt(i.quantity) || 1; 
-        
-        totalGross += g;
-        totalPure += pure;
-        
+        totalGross += g; totalPure += pure;
         return { ...i, g, p, mc, pure, qty };
     });
 
-    // Use finalVendorId instead of vendor_id
     const batchRes = await client.query(
         `INSERT INTO stock_batches (vendor_id, invoice_no, metal_type, total_gross_weight, total_pure_weight, item_count)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
         [finalVendorId, invoice_no || 'MANUAL', metal_type, totalGross, totalPure, items.length]
     );
     const batchId = batchRes.rows[0].id;
-
-    // Determine Source Type based on corrected ID
     const sourceType = finalVendorId ? 'VENDOR' : 'OWN';
 
     for (const item of processedItems) {
-        const prefix = metal_type ? metal_type.charAt(0).toUpperCase() : 'X';
-        const barcode = `${prefix}-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random()*1000)}`;
+        // USE THE BARCODE PROVIDED BY THE FRONTEND
+        let barcode = item.barcode;
+        
+        // Safety Fallback (Backend Generator if Frontend fails)
+        if (!barcode) {
+            const prefix = metal_type ? metal_type.charAt(0).toUpperCase() : 'G';
+            barcode = `${prefix}-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random()*1000)}`;
+        }
+
         const imgBuffer = item.item_image_base64 ? Buffer.from(item.item_image_base64, 'base64') : null;
 
         const iRes = await client.query(
@@ -150,17 +143,9 @@ router.post('/batch-add', async (req, res) => {
         );
     }
 
-    // Only update vendor balance if it's a real vendor (not null)
     if (finalVendorId) {
-        await client.query(
-            `UPDATE vendors SET balance_pure_weight = balance_pure_weight + $1 WHERE id = $2`,
-            [totalPure, finalVendorId]
-        );
-
-        const ledgerDesc = items.length === 1 
-            ? `Added Stock: ${items[0].item_name} (Inv#${invoice_no || 'NA'})`
-            : `Inv #${invoice_no || 'NA'}: Added ${items.length} Items`;
-
+        await client.query(`UPDATE vendors SET balance_pure_weight = balance_pure_weight + $1 WHERE id = $2`, [totalPure, finalVendorId]);
+        const ledgerDesc = `Inv #${invoice_no || 'NA'}: Added ${items.length} Items`;
         await client.query(
             `INSERT INTO vendor_transactions 
             (vendor_id, type, description, stock_pure_weight, balance_after, metal_type, reference_id, reference_type)
@@ -171,13 +156,10 @@ router.post('/batch-add', async (req, res) => {
 
     await client.query('COMMIT');
     res.json({ success: true, batchId });
-
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: err.message });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
 // SEARCH ROUTE
