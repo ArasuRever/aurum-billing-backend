@@ -86,16 +86,32 @@ router.get('/rates', async (req, res) => {
 
 router.post('/rates', async (req, res) => {
     try {
-        for(const [key, val] of Object.entries(req.body)) {
-            if (key === 'metal_type' || key === 'rate') continue; 
+        // Check if it's a single item update (from Dashboard)
+        const { metal_type, rate } = req.body;
+        
+        if (metal_type && rate !== undefined) {
             await pool.query(
-                `INSERT INTO daily_rates (metal_type, rate, updated_at) VALUES ($1, $2, NOW())
+                `INSERT INTO daily_rates (metal_type, rate, updated_at) 
+                 VALUES ($1, $2, NOW())
                  ON CONFLICT (metal_type) DO UPDATE SET rate = $2, updated_at = NOW()`,
-                [key, val]
+                [metal_type, rate]
             );
+        } else {
+            // Fallback for bulk updates (from Settings page)
+            for(const [key, val] of Object.entries(req.body)) {
+                await pool.query(
+                    `INSERT INTO daily_rates (metal_type, rate, updated_at) 
+                     VALUES ($1, $2, NOW())
+                     ON CONFLICT (metal_type) DO UPDATE SET rate = $2, updated_at = NOW()`,
+                    [key, val]
+                );
+            }
         }
         res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) { 
+        console.error(err);
+        res.status(500).json({ error: err.message }); 
+    }
 });
 
 router.get('/types', async (req, res) => {
