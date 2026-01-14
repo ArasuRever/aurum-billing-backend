@@ -74,35 +74,36 @@ router.post('/create-bill', async (req, res) => {
     await client.query('BEGIN');
 
     // --- SECURITY CHECK: VERIFY TOTALS ---
-    let backendGrossTotal = 0;
+    // UPDATED LOGIC: We sum the individual item totals (which already have discounts applied).
+    // This prevents the "Double Discounting" error where we subtracted discount twice.
+    let backendTaxable = 0;
     
     for (const item of items) {
-        let itemTotal = 0;
-        if (item.item_id) {
+        if (item.item_id && item.stock_type !== 'BULK') {
              const dbItemRes = await client.query(
                  "SELECT * FROM inventory_items WHERE id = $1 AND status = 'AVAILABLE' FOR UPDATE", 
                  [item.item_id]
              );
              
-             if (dbItemRes.rows.length === 0 && item.stock_type !== 'BULK') {
+             if (dbItemRes.rows.length === 0) {
                  throw new Error(`Item ${item.item_name} is no longer available.`);
              }
-             itemTotal = item.total; 
-        } else {
-             if (item.total < 0) throw new Error("Negative item total detected");
-             itemTotal = item.total;
         }
-        backendGrossTotal += parseFloat(itemTotal);
+        // Trust the rounded total from frontend (Price - Discount)
+        backendTaxable += parseFloat(item.total);
     }
 
-    const backendExchangeTotal = exchangeItems.reduce((acc, ex) => acc + parseFloat(ex.total), 0);
-    const backendTaxable = backendGrossTotal - (totals.totalDiscount || 0); 
-    const backendSGST = includeGST ? (backendTaxable * 0.015) : 0;
-    const backendCGST = includeGST ? (backendTaxable * 0.015) : 0;
+    const backendExchangeTotal = exchangeItems.reduce((acc, ex) => acc + (parseFloat(ex.total) || 0), 0);
+    
+    // Calculate Tax on the Taxable Amount
+    const backendSGST = includeGST ? Math.round(backendTaxable * 0.015) : 0;
+    const backendCGST = includeGST ? Math.round(backendTaxable * 0.015) : 0;
+    
     const backendNetRaw = backendTaxable + backendSGST + backendCGST - backendExchangeTotal;
     const backendNet = Math.round(backendNetRaw / 10) * 10; 
 
-    if (Math.abs(backendNet - totals.netPayable) > 1.00) {
+    // Allow a small margin (₹2) for floating point rounding differences
+    if (Math.abs(backendNet - totals.netPayable) > 2.00) {
         throw new Error(`Security Alert: Price Mismatch. Server: ${backendNet}, Client: ${totals.netPayable}`);
     }
     // --- END SECURITY CHECK ---
@@ -112,7 +113,7 @@ router.post('/create-bill', async (req, res) => {
     const onlineReceived = parseFloat(totals.onlineReceived) || 0;
     const totalPaid = cashReceived + onlineReceived; 
     const balance = backendNet - totalPaid;
-    const status = balance > 0 ? 'PARTIAL' : 'PAID';
+    const status = balance > 0.1 ? 'PARTIAL' : 'PAID';
 
     // A. Create Sale Record
     const saleRes = await client.query(
@@ -123,8 +124,8 @@ router.post('/create-bill', async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11, $12, $13, $14, $15) RETURNING id`,
       [
         invoiceNumber, customer.name, customer.phone, 
-        totals.grossTotal, totals.totalDiscount, totals.taxableAmount, 
-        backendSGST, backendCGST, totals.roundOff, 
+        totals.grossTotal, totals.totalDiscount, backendTaxable, 
+        backendSGST, backendCGST, (backendNet - backendNetRaw), 
         backendNet, totals.exchangeTotal, includeGST, totalPaid, balance, status
       ]
     );
